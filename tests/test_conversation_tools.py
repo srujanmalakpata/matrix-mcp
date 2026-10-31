@@ -1,61 +1,77 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastmcp import Client, FastMCP
 
-from matrix_mcp.matrix_client import MatrixAPIClient
-from matrix_mcp.matrix_events import EventContext, HistoryPage, TimelineEvent
-from matrix_mcp.matrix_media import DownloadedMedia, EventAttachment, UploadedMedia
-from matrix_mcp.matrix_rooms import InvitationPage, UnreadPage
-from matrix_mcp.mcp_server import create_mcp_server
+from matrix_mcp.config import MatrixMCPConfig
+from matrix_mcp.conversation_tools import READ_TOOLS, WRITE_TOOLS
+from matrix_mcp.matrix_events import UNTRUSTED_TEXT, EventContext, HistoryPage, TimelineEvent
+from matrix_mcp.matrix_rooms import MemberPage, Profile, Room, RoomInfo, UnreadPage
+from matrix_mcp.mcp_server import INSTRUCTIONS, create_mcp_server, session_factory
 
 if TYPE_CHECKING:
-    from matrix_mcp.matrix_client import MatrixDriver
+    from collections.abc import AsyncGenerator
 
-READ_TOOLS = {
-    "matrix_read_history",
-    "matrix_get_event_context",
+    from matrix_mcp.conversation_tools import ConversationClient
+
+ROOM = "!room:example.com"
+REMOVED_TOOLS = {
+    "matrix_read_room_recent",
     "matrix_list_invitations",
-    "matrix_get_unread",
     "matrix_download_media",
-}
-WRITE_TOOLS = {
-    "matrix_reply",
-    "matrix_react",
-    "matrix_edit_message",
+    "matrix_upload_media",
+    "matrix_send_media",
     "matrix_redact_event",
     "matrix_join_room",
     "matrix_leave_room",
     "matrix_create_room",
-    "matrix_mark_read",
-    "matrix_upload_media",
-    "matrix_send_media",
+    "matrix_invite_user",
+    "matrix_search_users",
+    "matrix_set_room_name",
+    "matrix_set_room_topic",
+    "matrix_set_room_avatar",
+    "matrix_set_display_name",
+    "matrix_set_avatar",
 }
+
+Calls = list[tuple[str, dict[str, Any]]]
+
+
+def event(event_id: str) -> TimelineEvent:
+    return TimelineEvent(
+        event_id=event_id,
+        sender="@bob:example.com",
+        type="m.room.message",
+        msgtype="m.text",
+        body="hello",
+    )
 
 
 class FakeEvents:
-    def __init__(self, calls: list[tuple[str, dict[str, Any]]]) -> None:
+    def __init__(self, calls: Calls) -> None:
         self.calls = calls
 
     async def history(self, room_id: str, **kwargs: Any) -> HistoryPage:
         self.calls.append(("history", {"room_id": room_id, **kwargs}))
-        return HistoryPage(events=[], next_batch="next")
+        return HistoryPage(events=[event("$e")], next_batch="next")
 
     async def context(self, room_id: str, event_id: str, **kwargs: Any) -> EventContext:
         self.calls.append(("context", {"room_id": room_id, "event_id": event_id, **kwargs}))
-        return EventContext(
-            event=TimelineEvent(
-                event_id=event_id,
-                sender="@alice:example.com",
-                type="m.room.message",
-                msgtype="m.text",
-                body="hello",
-            ),
-            events_before=[],
-            events_after=[],
-        )
+        return EventContext(event=event(event_id), events_before=[], events_after=[])
+
+    async def thread(self, room_id: str, thread_id: str, **kwargs: Any) -> HistoryPage:
+        self.calls.append(("thread", {"room_id": room_id, "thread_id": thread_id, **kwargs}))
+        return HistoryPage(events=[event(thread_id)])
+
+    async def send_text(self, room_id: str, body: str, **kwargs: Any) -> str:
+        # Yield so parallel calls interleave, as they do against a real homeserver.
+        await asyncio.sleep(0)
+        self.calls.append(("send_text", {"room_id": room_id, "body": body, **kwargs}))
+        return f"$sent-{room_id}"
 
     async def reply(self, room_id: str, event_id: str, body: str, **kwargs: Any) -> str:
         self.calls.append(
@@ -75,33 +91,30 @@ class FakeEvents:
         )
         return "$edit"
 
-    async def redact(self, room_id: str, event_id: str, **kwargs: Any) -> str:
-        self.calls.append(("redact", {"room_id": room_id, "event_id": event_id, **kwargs}))
-        return "$redaction"
-
-    async def attachment(self, room_id: str, event_id: str) -> EventAttachment:
-        self.calls.append(("attachment", {"room_id": room_id, "event_id": event_id}))
-        return EventAttachment(url="mxc://example.com/media", mimetype="text/plain")
-
 
 class FakeRooms:
-    def __init__(self, calls: list[tuple[str, dict[str, Any]]]) -> None:
+    def __init__(self, calls: Calls) -> None:
         self.calls = calls
 
-    async def invitations(self, **kwargs: Any) -> InvitationPage:
-        self.calls.append(("invitations", kwargs))
-        return InvitationPage(rooms=[], total=0, next_offset=None)
+    async def whoami(self) -> dict[str, str | None]:
+        self.calls.append(("whoami", {}))
+        return {"user_id": "@alice:example.com", "device_id": "TESTDEVICE"}
 
-    async def join(self, room_id_or_alias: str) -> str:
-        self.calls.append(("join", {"room_id_or_alias": room_id_or_alias}))
-        return "!joined"
+    async def list_rooms(self) -> list[Room]:
+        self.calls.append(("list_rooms", {}))
+        return [Room(room_id=ROOM, name="Planning")]
 
-    async def leave(self, room_id: str, **kwargs: Any) -> None:
-        self.calls.append(("leave", {"room_id": room_id, **kwargs}))
+    async def info(self, room_id: str) -> RoomInfo:
+        self.calls.append(("info", {"room_id": room_id}))
+        return RoomInfo(room_id=room_id, name="Planning")
 
-    async def create(self, **kwargs: Any) -> str:
-        self.calls.append(("create", kwargs))
-        return "!created"
+    async def members(self, room_id: str, **kwargs: Any) -> MemberPage:
+        self.calls.append(("members", {"room_id": room_id, **kwargs}))
+        return MemberPage(members=[], total=0, next_offset=None)
+
+    async def profile(self, user_id: str | None = None) -> Profile:
+        self.calls.append(("profile", {"user_id": user_id}))
+        return Profile(user_id=user_id or "@alice:example.com")
 
     async def unread(self, **kwargs: Any) -> UnreadPage:
         self.calls.append(("unread", kwargs))
@@ -111,394 +124,218 @@ class FakeRooms:
         self.calls.append(("mark_read", {"room_id": room_id, "event_id": event_id, **kwargs}))
 
 
-class FakeMedia:
-    def __init__(self, calls: list[tuple[str, dict[str, Any]]]) -> None:
-        self.calls = calls
-
-    async def upload(self, data_base64: str, filename: str, **kwargs: Any) -> UploadedMedia:
-        self.calls.append(("upload", {"data_base64": data_base64, "filename": filename, **kwargs}))
-        return UploadedMedia(
-            content_uri="mxc://example.com/media",
-            filename=filename,
-            content_type=kwargs["content_type"],
-            size=1,
-        )
-
-    async def download(
-        self, media_url: str, *, attachment: EventAttachment | None = None
-    ) -> DownloadedMedia:
-        self.calls.append(("download", {"media_url": media_url, "attachment": attachment}))
-        return DownloadedMedia(
-            media_url=media_url,
-            content_type="text/plain",
-            size=1,
-            data_base64="eA==",
-        )
-
-    async def send(self, room_id: str, media_url: str, filename: str, **kwargs: Any) -> str:
-        self.calls.append(
-            (
-                "send_media",
-                {"room_id": room_id, "media_url": media_url, "filename": filename, **kwargs},
-            )
-        )
-        return "$media"
-
-
-class GroupedDriver:
+class FakeSession:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.calls: Calls = []
         self.events = FakeEvents(self.calls)
         self.rooms = FakeRooms(self.calls)
-        self.media = FakeMedia(self.calls)
 
 
-def grouped_server(driver: GroupedDriver) -> FastMCP:
-    def factory() -> MatrixAPIClient:
-        return MatrixAPIClient(driver=cast("MatrixDriver", driver))
+def fake_server(session: FakeSession) -> FastMCP:
+    @asynccontextmanager
+    async def client() -> AsyncGenerator[ConversationClient]:
+        yield cast("ConversationClient", session)
 
-    return create_mcp_server(factory)
-
-
-async def test_conversation_tools_expose_all_five_workflows() -> None:
-    async with Client(create_mcp_server()) as client:
-        names = {tool.name for tool in await client.list_tools()}
-    assert names >= READ_TOOLS | WRITE_TOOLS
+    return create_mcp_server(client)
 
 
-async def test_conversation_tools_annotate_reads_and_mutations() -> None:
-    async with Client(create_mcp_server()) as client:
-        tools = {tool.name: tool for tool in await client.list_tools()}
+async def tools_by_name() -> dict[str, Any]:
+    async with Client(fake_server(FakeSession())) as client:
+        return {tool.name: tool for tool in await client.list_tools()}
+
+
+async def test_server_registers_exactly_the_kept_tools() -> None:
+    names = set(await tools_by_name())
+
+    assert names == set(READ_TOOLS) | set(WRITE_TOOLS)
+    assert len(names) == 14
+    assert not names & REMOVED_TOOLS
+
+
+async def test_tools_annotate_reads_and_writes() -> None:
+    tools = await tools_by_name()
+
     for name in READ_TOOLS:
-        assert name in tools
-        assert tools[name].annotations is not None
         assert tools[name].annotations.readOnlyHint is True
     for name in WRITE_TOOLS:
-        assert name in tools
-        assert tools[name].annotations is not None
         assert tools[name].annotations.readOnlyHint is False
 
 
-@pytest.mark.parametrize("name", ["matrix_read_history", "matrix_get_event_context"])
-async def test_new_history_tools_require_raw_room_ids(name: str) -> None:
-    async with Client(create_mcp_server()) as client:
-        tools = {tool.name: tool for tool in await client.list_tools()}
-    assert name in tools
-    schema = tools[name].inputSchema["properties"]["room_id"]
-    assert schema["type"] == "string"
-    assert schema.get("pattern")
+async def test_no_tool_takes_a_local_path_url_or_credentials() -> None:
+    forbidden = {"file_path", "path", "filename", "media_url", "homeserver", "access_token"}
+
+    for tool in (await tools_by_name()).values():
+        assert not forbidden & tool.inputSchema.get("properties", {}).keys(), tool.name
 
 
-async def test_media_arguments_cannot_choose_server_paths_or_urls() -> None:
-    async with Client(create_mcp_server()) as client:
-        tools = {tool.name: tool for tool in await client.list_tools()}
-    for name in ("matrix_upload_media", "matrix_download_media", "matrix_send_media"):
-        assert name in tools
-        properties = tools[name].inputSchema["properties"]
-        assert not {"file_path", "homeserver", "access_token", "http_url"} & properties.keys()
-
-
-async def test_send_media_size_schema_uses_json_safe_integer_bound() -> None:
-    async with Client(create_mcp_server()) as client:
-        tools = {tool.name: tool for tool in await client.list_tools()}
-    size_schema = tools["matrix_send_media"].inputSchema["properties"]["size"]
-    integer_schema = next(item for item in size_schema["anyOf"] if item.get("type") == "integer")
-    assert integer_schema["minimum"] == 0
-    assert integer_schema["maximum"] == 2**53 - 1
-
-
-@pytest.mark.parametrize(
-    "media_url",
-    [
-        "mxc://example..com/media",
-        "mxc://./media",
-        "mxc://-example.com/media",
-        "mxc://example-.com/media",
-        "mxc://éxample.com/media",
-    ],
-)
-async def test_media_url_schema_rejects_invalid_server_authorities(media_url: str) -> None:
-    driver = GroupedDriver()
-    async with Client(grouped_server(driver)) as client:
+async def test_send_message_refuses_a_file_path_argument() -> None:
+    session = FakeSession()
+    async with Client(fake_server(session)) as client:
         result = await client.call_tool(
-            "matrix_download_media",
-            {"media_url": media_url},
+            "matrix_send_message",
+            {"room_id": ROOM, "body": "hi", "file_path": "~/.ssh/id_ed25519"},
             raise_on_error=False,
         )
+
     assert result.is_error
-    assert driver.calls == []
+    assert session.calls == []
 
 
-@pytest.mark.parametrize("media_url", ["MXC://example.com/media", "MxC://example.com/media"])
-async def test_media_url_schema_accepts_case_insensitive_scheme(media_url: str) -> None:
-    driver = GroupedDriver()
-    async with Client(grouped_server(driver)) as client:
-        result = await client.call_tool("matrix_download_media", {"media_url": media_url})
-
-    assert not result.is_error
-    assert driver.calls == [("download", {"media_url": media_url, "attachment": None})]
-
-
-async def test_history_dispatch_accepts_domainless_room_id_without_marking_read() -> None:
-    driver = GroupedDriver()
-    async with Client(grouped_server(driver)) as client:
+@pytest.mark.parametrize("room_id", ["1", "room", "#alias:example.com", "!room:example.com/x"])
+async def test_room_arguments_take_raw_room_ids_only(room_id: str) -> None:
+    session = FakeSession()
+    async with Client(fake_server(session)) as client:
         result = await client.call_tool(
-            "matrix_read_history",
-            {"room_id": "!v12hash", "limit": 7, "before": "cursor"},
+            "matrix_send_message", {"room_id": room_id, "body": "hi"}, raise_on_error=False
         )
-    assert not result.is_error
-    assert driver.calls == [("history", {"room_id": "!v12hash", "limit": 7, "before": "cursor"})]
+
+    assert result.is_error
+    assert session.calls == []
+
+
+async def test_parallel_sends_each_reach_their_own_room() -> None:
+    session = FakeSession()
+    rooms = [f"!r{number}:example.com" for number in range(10)]
+    async with Client(fake_server(session)) as client:
+        results = await asyncio.gather(
+            *(
+                client.call_tool("matrix_send_message", {"room_id": room, "body": room})
+                for room in rooms
+            )
+        )
+
+    assert [result.data.event_id for result in results] == [f"$sent-{room}" for room in rooms]
+    assert sorted((call["room_id"], call["body"]) for _, call in session.calls) == sorted(
+        (room, room) for room in rooms
+    )
 
 
 @pytest.mark.parametrize(
     ("name", "arguments", "expected_call"),
     [
+        ("matrix_whoami", {}, ("whoami", {})),
+        ("matrix_list_rooms", {}, ("list_rooms", {})),
+        ("matrix_get_room_info", {"room_id": ROOM}, ("info", {"room_id": ROOM})),
+        (
+            "matrix_list_room_members",
+            {"room_id": ROOM, "limit": 5, "offset": 2},
+            ("members", {"room_id": ROOM, "limit": 5, "offset": 2}),
+        ),
+        ("matrix_get_profile", {}, ("profile", {"user_id": None})),
+        (
+            "matrix_read_history",
+            {"room_id": "!v12hash", "limit": 7, "before": "cursor"},
+            ("history", {"room_id": "!v12hash", "limit": 7, "before": "cursor"}),
+        ),
         (
             "matrix_get_event_context",
-            {"room_id": "!room:example.com", "event_id": "$event", "limit": 9},
+            {"room_id": ROOM, "event_id": "$e", "limit": 9},
+            ("context", {"room_id": ROOM, "event_id": "$e", "limit": 9}),
+        ),
+        (
+            "matrix_read_thread",
+            {"room_id": ROOM, "thread_id": "$root", "limit": 3},
+            ("thread", {"room_id": ROOM, "thread_id": "$root", "limit": 3, "before": None}),
+        ),
+        (
+            "matrix_get_unread",
+            {"limit": 4},
+            ("unread", {"limit": 4, "offset": 0, "timeline_limit": 20}),
+        ),
+        (
+            "matrix_send_message",
+            {"room_id": ROOM, "body": "hi", "thread_id": "$root", "mentions": ["@b:example.com"]},
             (
-                "context",
-                {"room_id": "!room:example.com", "event_id": "$event", "limit": 9},
+                "send_text",
+                {
+                    "room_id": ROOM,
+                    "body": "hi",
+                    "thread_id": "$root",
+                    "mentions": ["@b:example.com"],
+                    "transaction_id": None,
+                },
             ),
         ),
         (
             "matrix_reply",
-            {"room_id": "!room:example.com", "event_id": "$event", "body": "reply"},
-            (
-                "reply",
-                {
-                    "room_id": "!room:example.com",
-                    "event_id": "$event",
-                    "body": "reply",
-                    "transaction_id": None,
-                },
-            ),
+            {"room_id": ROOM, "event_id": "$e", "body": "yes"},
+            ("reply", {"room_id": ROOM, "event_id": "$e", "body": "yes", "transaction_id": None}),
         ),
         (
             "matrix_react",
-            {"room_id": "!room:example.com", "event_id": "$event", "key": "👍"},
-            (
-                "react",
-                {
-                    "room_id": "!room:example.com",
-                    "event_id": "$event",
-                    "key": "👍",
-                    "transaction_id": None,
-                },
-            ),
+            {"room_id": ROOM, "event_id": "$e", "key": "👍"},
+            ("react", {"room_id": ROOM, "event_id": "$e", "key": "👍", "transaction_id": None}),
         ),
         (
             "matrix_edit_message",
-            {"room_id": "!room:example.com", "event_id": "$event", "body": "fixed"},
-            (
-                "edit",
-                {
-                    "room_id": "!room:example.com",
-                    "event_id": "$event",
-                    "body": "fixed",
-                    "transaction_id": None,
-                },
-            ),
-        ),
-        (
-            "matrix_redact_event",
-            {"room_id": "!room:example.com", "event_id": "$event", "reason": "duplicate"},
-            (
-                "redact",
-                {
-                    "room_id": "!room:example.com",
-                    "event_id": "$event",
-                    "reason": "duplicate",
-                    "transaction_id": None,
-                },
-            ),
-        ),
-        (
-            "matrix_list_invitations",
-            {"limit": 12, "offset": 3},
-            ("invitations", {"limit": 12, "offset": 3}),
-        ),
-        (
-            "matrix_join_room",
-            {"room_id_or_alias": "#general:example.com"},
-            ("join", {"room_id_or_alias": "#general:example.com"}),
-        ),
-        (
-            "matrix_leave_room",
-            {"room_id": "!v12hash", "reason": "done"},
-            ("leave", {"room_id": "!v12hash", "reason": "done"}),
-        ),
-        (
-            "matrix_create_room",
-            {
-                "name": "Project",
-                "topic": "Planning",
-                "invite": ["@bob:example.com"],
-            },
-            (
-                "create",
-                {
-                    "name": "Project",
-                    "topic": "Planning",
-                    "invite": ["@bob:example.com"],
-                },
-            ),
-        ),
-        (
-            "matrix_get_unread",
-            {"limit": 8, "offset": 2, "timeline_limit": 6},
-            (
-                "unread",
-                {"limit": 8, "offset": 2, "timeline_limit": 6},
-            ),
+            {"room_id": ROOM, "event_id": "$e", "body": "fixed"},
+            ("edit", {"room_id": ROOM, "event_id": "$e", "body": "fixed", "transaction_id": None}),
         ),
         (
             "matrix_mark_read",
-            {"room_id": "!v12hash", "event_id": "$event", "public_receipt": True},
-            (
-                "mark_read",
-                {"room_id": "!v12hash", "event_id": "$event", "public_receipt": True},
-            ),
-        ),
-        (
-            "matrix_upload_media",
-            {"data_base64": "eA==", "filename": "x.txt", "content_type": "text/plain"},
-            (
-                "upload",
-                {"data_base64": "eA==", "filename": "x.txt", "content_type": "text/plain"},
-            ),
-        ),
-        (
-            "matrix_download_media",
-            {"media_url": "mxc://example.com/media"},
-            ("download", {"media_url": "mxc://example.com/media", "attachment": None}),
-        ),
-        (
-            "matrix_send_media",
-            {
-                "room_id": "!v12hash",
-                "media_url": "mxc://example.com/media",
-                "filename": "x.txt",
-                "content_type": "text/plain",
-                "size": 1,
-                "thread_id": "$root",
-                "transaction_id": "tx-1",
-            },
-            (
-                "send_media",
-                {
-                    "room_id": "!v12hash",
-                    "media_url": "mxc://example.com/media",
-                    "filename": "x.txt",
-                    "content_type": "text/plain",
-                    "size": 1,
-                    "thread_id": "$root",
-                    "transaction_id": "tx-1",
-                },
-            ),
+            {"room_id": ROOM, "event_id": "$e"},
+            ("mark_read", {"room_id": ROOM, "event_id": "$e", "public_receipt": False}),
         ),
     ],
 )
-async def test_conversation_tool_dispatches_exact_arguments(
+async def test_tools_dispatch_exact_arguments(
     name: str, arguments: dict[str, Any], expected_call: tuple[str, dict[str, Any]]
 ) -> None:
-    driver = GroupedDriver()
-    async with Client(grouped_server(driver)) as client:
+    session = FakeSession()
+    async with Client(fake_server(session)) as client:
         result = await client.call_tool(name, arguments)
+
     assert not result.is_error
-    assert driver.calls == [expected_call]
+    assert session.calls == [expected_call]
 
 
 @pytest.mark.parametrize(
     ("name", "arguments"),
     [
-        ("matrix_read_history", {"room_id": "room", "limit": 20}),
-        ("matrix_get_event_context", {"room_id": "!room", "event_id": "event"}),
-        ("matrix_read_history", {"room_id": "!room:example.com", "limit": 0}),
-        (
-            "matrix_get_event_context",
-            {"room_id": "!room:example.com", "event_id": "$e", "limit": 51},
-        ),
+        ("matrix_read_history", {"room_id": ROOM, "limit": 0}),
+        ("matrix_get_event_context", {"room_id": ROOM, "event_id": "event"}),
+        ("matrix_read_thread", {"room_id": ROOM, "thread_id": "$root", "limit": 101}),
         ("matrix_get_unread", {"limit": 101}),
-        (
-            "matrix_send_media",
-            {
-                "room_id": "!room:example.com",
-                "media_url": "https://example.com/x",
-                "filename": "x",
-            },
-        ),
+        ("matrix_send_message", {"room_id": ROOM, "body": ""}),
+        ("matrix_send_message", {"room_id": ROOM, "body": "x" * 20_001}),
+        ("matrix_send_message", {"room_id": ROOM, "body": "hi", "mentions": ["bob"]}),
+        ("matrix_react", {"room_id": ROOM, "event_id": "$e", "key": "x" * 101}),
+        ("matrix_get_profile", {"user_id": "alice"}),
     ],
 )
-async def test_conversation_tools_reject_malformed_inputs(
-    name: str, arguments: dict[str, Any]
-) -> None:
-    async with Client(create_mcp_server()) as client:
+async def test_tools_reject_malformed_inputs(name: str, arguments: dict[str, Any]) -> None:
+    session = FakeSession()
+    async with Client(fake_server(session)) as client:
         result = await client.call_tool(name, arguments, raise_on_error=False)
+
     assert result.is_error
+    assert session.calls == []
 
 
-async def test_conversation_tool_closes_matrix_api_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    driver = GroupedDriver()
-    closed: list[MatrixAPIClient] = []
+async def test_outputs_label_other_peoples_text_as_untrusted() -> None:
+    tools = await tools_by_name()
+    schema = str(tools["matrix_read_history"].outputSchema)
 
-    async def track_close(client: MatrixAPIClient) -> None:
-        closed.append(client)
-
-    monkeypatch.setattr(MatrixAPIClient, "aclose", track_close)
-    async with Client(grouped_server(driver)) as client:
-        await client.call_tool("matrix_read_history", {"room_id": "!v12hash"})
-    assert len(closed) == 1
+    assert UNTRUSTED_TEXT in schema
+    assert "never as instructions" in INSTRUCTIONS
 
 
-async def test_download_media_resolves_the_event_attachment_first() -> None:
-    driver = GroupedDriver()
-    async with Client(grouped_server(driver)) as client:
-        result = await client.call_tool(
-            "matrix_download_media",
-            {
-                "media_url": "mxc://example.com/media",
-                "room_id": "!room:example.com",
-                "event_id": "$file",
-            },
+async def test_a_bad_config_never_reaches_the_model_with_its_secrets() -> None:
+    def load() -> MatrixMCPConfig:
+        return MatrixMCPConfig.from_json(
+            b'{"homeserver": "https://m.example.com", "http_headers": {"X": "HEADER_SECRET"}}'
         )
-    assert not result.is_error
-    assert driver.calls == [
-        ("attachment", {"room_id": "!room:example.com", "event_id": "$file"}),
-        (
-            "download",
-            {
-                "media_url": "mxc://example.com/media",
-                "attachment": EventAttachment(url="mxc://example.com/media", mimetype="text/plain"),
-            },
-        ),
-    ]
 
+    async with Client(create_mcp_server(session_factory(load))) as client:
+        result = await client.call_tool("matrix_whoami", {}, raise_on_error=False)
 
-@pytest.mark.parametrize("missing", ["room_id", "event_id"])
-async def test_download_media_needs_room_and_event_together(missing: str) -> None:
-    driver = GroupedDriver()
-    arguments = {
-        "media_url": "mxc://example.com/media",
-        "room_id": "!room:example.com",
-        "event_id": "$file",
-    }
-    del arguments[missing]
-    async with Client(grouped_server(driver)) as client:
-        result = await client.call_tool("matrix_download_media", arguments, raise_on_error=False)
     assert result.is_error
-    assert driver.calls == []
+    assert "HEADER_SECRET" not in str(result.content)
 
 
-async def test_tool_guidance_steers_encrypted_file_sharing() -> None:
-    async with Client(create_mcp_server()) as client:
-        tools = {tool.name: tool.description or "" for tool in await client.list_tools()}
-        instructions = client.initialize_result.instructions or ""
+async def test_every_read_tool_tells_the_model_its_text_is_untrusted() -> None:
+    tools = await tools_by_name()
 
-    assert "unencrypted" in tools["matrix_upload_media"]
-    assert "file_path" in tools["matrix_upload_media"]
-    assert "encrypted" in tools["matrix_send_message"]
-    assert "file_path" in instructions
-    assert "missing room key" in instructions
+    for name in READ_TOOLS:
+        if name != "matrix_whoami":
+            assert "untrusted" in (tools[name].description or ""), name

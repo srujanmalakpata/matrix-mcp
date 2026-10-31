@@ -17,7 +17,7 @@ from matrix_mcp.cli import app
 result = CliRunner().invoke(app, ["--help"])
 loaded = {
     name: name in sys.modules
-    for name in ["fastmcp", "httpx", "nio", "platformdirs", "pydantic"]
+    for name in ["fastmcp", "httpx", "platformdirs", "pydantic"]
 }
 print(json.dumps({"exit_code": result.exit_code, "loaded": loaded}))
 """
@@ -34,7 +34,6 @@ print(json.dumps({"exit_code": result.exit_code, "loaded": loaded}))
     assert payload["loaded"] == {
         "fastmcp": False,
         "httpx": False,
-        "nio": False,
         "platformdirs": False,
         "pydantic": False,
     }

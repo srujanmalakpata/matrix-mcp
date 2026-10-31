@@ -11,7 +11,6 @@ from urllib.parse import quote
 
 import httpx
 
-from matrix_mcp.http_headers import resolve_http_headers
 from matrix_mcp.tls import default_ssl_context
 
 if TYPE_CHECKING:
@@ -26,6 +25,9 @@ RATE_LIMIT_RETRIES = 2
 _CONTROL_CODE_BOUNDARY = 32
 _MAX_TRANSACTION_ID_LENGTH = 255
 _ERRCODE_PATTERN = re.compile(r"M_[A-Z_0-9]{1,80}")
+_DELETE = 127
+DEADLINE_SECONDS = 60.0
+NO_RESPONSE = "Matrix API request failed before receiving a response"
 
 
 class MatrixHTTPError(RuntimeError):
@@ -41,7 +43,6 @@ class MatrixHTTP:
         if not token or not config.user_id:
             msg = "Matrix credentials are incomplete. Run `matrix-mcp auth` first."
             raise RuntimeError(msg)
-        self._config = config
         self._access_token = token
         self._homeserver = config.normalized_homeserver
         if "?" in self._homeserver or "#" in self._homeserver:
@@ -50,50 +51,37 @@ class MatrixHTTP:
         self.user_id = config.user_id
 
     def client(self) -> AbstractAsyncContextManager[httpx.AsyncClient]:
-        try:
-            headers = resolve_http_headers(
-                self._config.http_headers,
-                self._config.http_header_commands,
-            )
-        except (RuntimeError, ValueError):
-            msg = "Matrix custom HTTP header resolution failed"
-            raise RuntimeError(msg) from None
-        headers.update(
-            {
-                "Accept": "application/json",
-                "Accept-Encoding": "identity",
-                "Authorization": f"Bearer {self._access_token}",
-            }
-        )
-        return httpx.AsyncClient(
-            base_url=f"{self._homeserver}/",
-            headers=headers,
-            timeout=30,
-            follow_redirects=False,
-            verify=default_ssl_context(),
+        return http_client(
+            base_url=self._homeserver,
+            headers={"Authorization": f"Bearer {self._access_token}"},
         )
 
-    async def json(  # noqa: PLR0913
+    async def json(
         self,
         method: str,
         path: str,
         *,
         body: dict[str, object] | None = None,
-        content: bytes | None = None,
-        headers: dict[str, str] | None = None,
         params: dict[str, str | int] | None = None,
     ) -> dict[str, Any]:
+        """One request, retrying rate limits, all within DEADLINE_SECONDS."""
         if not path.startswith("/"):
             msg = "Matrix API path must start with '/'"
             raise ValueError(msg)
-        if body is not None and content is not None:
-            msg = "Matrix API request cannot include both body and content"
-            raise ValueError(msg)
-        if headers is not None and any(name.lower() == "authorization" for name in headers):
-            msg = "Matrix API request headers cannot override authorization"
-            raise ValueError(msg)
-        request_headers = dict(headers or {})
-        request_headers["Accept-Encoding"] = "identity"
+        try:
+            async with asyncio.timeout(DEADLINE_SECONDS):
+                return await self._json(method, path, body=body, params=params)
+        except TimeoutError:
+            raise RuntimeError(NO_RESPONSE) from None
+
+    async def _json(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, object] | None,
+        params: dict[str, str | int] | None,
+    ) -> dict[str, Any]:
         url = f"{self._homeserver}{path}"
         async with self.client() as client:
             for attempt in range(RATE_LIMIT_RETRIES + 1):
@@ -102,8 +90,6 @@ class MatrixHTTP:
                         method,
                         url,
                         json=body,
-                        content=content,
-                        headers=request_headers,
                         params=params,
                     ) as response:
                         if response.is_redirect:
@@ -113,8 +99,7 @@ class MatrixHTTP:
                             raise MatrixHTTPError(msg, status_code=response.status_code)
                         response_content = await _read_bounded(response)
                 except httpx.HTTPError as exc:
-                    msg = "Matrix API request failed before receiving a response"
-                    raise RuntimeError(msg) from exc
+                    raise RuntimeError(NO_RESPONSE) from exc
 
                 payload = _response_payload(response, response_content)
                 errcode = _safe_errcode(payload.get("errcode"))
@@ -150,11 +135,62 @@ class MatrixHTTP:
         return True
 
 
+async def post_json(
+    homeserver: str,
+    path: str,
+    body: dict[str, object],
+    *,
+    access_token: str | None = None,
+) -> dict[str, Any]:
+    """POST once with MatrixHTTP.json's bounds, with or without a token (login, logout)."""
+    if not path.startswith("/"):
+        msg = "Matrix API path must start with '/'"
+        raise ValueError(msg)
+    headers = {} if access_token is None else {"Authorization": f"Bearer {access_token}"}
+    async with http_client(base_url=homeserver, headers=headers) as client:
+        try:
+            async with (
+                asyncio.timeout(DEADLINE_SECONDS),
+                client.stream("POST", f"{homeserver}{path}", json=body) as response,
+            ):
+                if response.is_redirect:
+                    msg = f"Matrix API request refused HTTP redirect ({response.status_code})"
+                    raise MatrixHTTPError(msg, status_code=response.status_code)
+                content = await _read_bounded(response)
+        except (httpx.HTTPError, TimeoutError) as exc:
+            raise RuntimeError(NO_RESPONSE) from exc
+    payload = _response_payload(response, content)
+    if response.is_error:
+        errcode = _safe_errcode(payload.get("errcode"))
+        detail = f" ({errcode})" if errcode else ""
+        msg = f"Matrix API request failed with HTTP {response.status_code}{detail}"
+        raise MatrixHTTPError(msg, status_code=response.status_code, errcode=errcode)
+    return payload
+
+
+def http_client(
+    *, base_url: str, headers: dict[str, str] | None = None
+) -> AbstractAsyncContextManager[httpx.AsyncClient]:
+    """An HTTP client that never follows redirects or reads proxy settings from the environment."""
+    return httpx.AsyncClient(
+        base_url=f"{base_url}/",
+        headers={"Accept": "application/json", "Accept-Encoding": "identity", **(headers or {})},
+        timeout=30,
+        follow_redirects=False,
+        trust_env=False,
+        verify=default_ssl_context(),
+    )
+
+
+def _unsafe_character(char: str) -> bool:
+    return char.isspace() or ord(char) < _CONTROL_CODE_BOUNDARY or ord(char) == _DELETE
+
+
 def quote_matrix_id(value: str, *, sigil: str, label: str) -> str:
     if (
         not value.startswith(sigil)
         or len(value) == 1
-        or any(char.isspace() or ord(char) < _CONTROL_CODE_BOUNDARY for char in value)
+        or any(_unsafe_character(char) for char in value)
     ):
         msg = f"Invalid Matrix {label}"
         raise ValueError(msg)
@@ -166,7 +202,7 @@ def quote_transaction_id(value: str) -> str:
         not value
         or value in {".", ".."}
         or len(value) > _MAX_TRANSACTION_ID_LENGTH
-        or any(char.isspace() or ord(char) < _CONTROL_CODE_BOUNDARY for char in value)
+        or any(_unsafe_character(char) for char in value)
     ):
         msg = "Invalid Matrix transaction ID"
         raise ValueError(msg)

@@ -9,7 +9,6 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from matrix_mcp.config import MatrixMCPConfig
-from matrix_mcp.e2ee import DecryptedEvent
 from matrix_mcp.matrix_http import MatrixHTTP
 from matrix_mcp.matrix_rooms import MatrixRooms
 
@@ -53,50 +52,9 @@ async def matrix() -> AsyncIterator[tuple[MatrixRooms, RoomEndpoint]]:
                 user_id="@alice:example.com",
                 device_id="TESTDEVICE",
                 access_token="test-token",
-                http_headers={"X-Example": "custom-value"},
             )
         )
         yield MatrixRooms(http), endpoint
-
-
-async def test_create_room_is_private(matrix: tuple[MatrixRooms, RoomEndpoint]) -> None:
-    rooms, endpoint = matrix
-    endpoint.responses[("POST", "/_matrix/client/v3/createRoom")] = (
-        {"room_id": "!created:example.com"},
-        200,
-    )
-    assert await rooms.create(name="Planning", invite=["@bob:example.com"]) == (
-        "!created:example.com"
-    )
-    request = endpoint.requests[-1]
-    assert request["body"] == {
-        "visibility": "private",
-        "preset": "private_chat",
-        "name": "Planning",
-        "invite": ["@bob:example.com"],
-    }
-    assert request["headers"]["Authorization"] == "Bearer test-token"
-    assert request["headers"]["X-Example"] == "custom-value"
-
-
-@pytest.mark.parametrize("identifier", ["!room:example.com", "#project:example.com", "!room_hash"])
-async def test_join_resolves_room_ids_and_aliases(
-    matrix: tuple[MatrixRooms, RoomEndpoint], identifier: str
-) -> None:
-    rooms, endpoint = matrix
-    endpoint.responses[("POST", f"/_matrix/client/v3/join/{identifier}")] = (
-        {"room_id": ROOM},
-        200,
-    )
-    assert await rooms.join(identifier) == ROOM
-    assert endpoint.requests[-1]["method"] == "POST"
-
-
-async def test_leave_passes_explicit_reason(matrix: tuple[MatrixRooms, RoomEndpoint]) -> None:
-    rooms, endpoint = matrix
-    endpoint.responses[("POST", f"{ROOM_PATH}/leave")] = ({}, 200)
-    await rooms.leave(ROOM, reason="No longer needed")
-    assert endpoint.requests[-1]["body"] == {"reason": "No longer needed"}
 
 
 @pytest.mark.parametrize("public_receipt", [False, True])
@@ -196,81 +154,6 @@ async def test_mark_read_does_not_clear_unread_after_marker_failure(
     assert [request["method"] for request in endpoint.requests] == ["GET", "POST"]
 
 
-@pytest.mark.parametrize("identifier", ["room", "https://example.com", "!room:example.com/leave"])
-async def test_invalid_join_target_is_rejected_before_http(
-    matrix: tuple[MatrixRooms, RoomEndpoint], identifier: str
-) -> None:
-    rooms, endpoint = matrix
-    with pytest.raises(ValueError, match="Invalid Matrix"):
-        await rooms.join(identifier)
-    assert not endpoint.requests
-
-
-async def test_invalid_invitee_does_not_create_room(
-    matrix: tuple[MatrixRooms, RoomEndpoint],
-) -> None:
-    rooms, endpoint = matrix
-    with pytest.raises(ValueError, match="Invalid Matrix"):
-        await rooms.create(invite=["bob"])
-    assert not endpoint.requests
-
-
-async def test_invitations_include_inviter_and_stable_pages(
-    matrix: tuple[MatrixRooms, RoomEndpoint],
-) -> None:
-    rooms, endpoint = matrix
-    endpoint.responses[("GET", "/_matrix/client/v3/sync")] = (
-        {
-            "next_batch": "next",
-            "rooms": {
-                "invite": {
-                    "!z:example.com": {"invite_state": {"events": []}},
-                    "!a:example.com": {
-                        "invite_state": {
-                            "events": [
-                                {"type": "m.room.name", "content": {"name": "Planning"}},
-                                {
-                                    "type": "m.room.member",
-                                    "state_key": "@alice:example.com",
-                                    "sender": "@bob:example.com",
-                                    "content": {"membership": "invite"},
-                                },
-                            ]
-                        }
-                    },
-                }
-            },
-        },
-        200,
-    )
-    first = await rooms.invitations(limit=1)
-    second = await rooms.invitations(limit=1, offset=1)
-    assert first.rooms[0].room_id == "!a:example.com"
-    assert first.rooms[0].name == "Planning"
-    assert first.rooms[0].inviter == "@bob:example.com"
-    assert first.total == 2
-    assert first.next_offset == 1
-    assert second.rooms[0].room_id == "!z:example.com"
-    assert second.next_offset is None
-    assert {request["method"] for request in endpoint.requests} == {"GET"}
-    sync_filter = json.loads(endpoint.requests[0]["query"]["filter"])
-    assert sync_filter["event_fields"] == [
-        "event_id",
-        "sender",
-        "origin_server_ts",
-        "state_key",
-        "type",
-        "content.body",
-        "content.m\\.mentions",
-        "content.name",
-        "content.unread",
-    ]
-    assert "m.room.member" in sync_filter["room"]["state"]["types"]
-    assert sync_filter["room"]["timeline"]["types"] == []
-    assert sync_filter["room"]["timeline"]["limit"] > 0
-    assert endpoint.requests[0]["query"]["set_presence"] == "offline"
-
-
 async def test_unread_returns_counts_mentions_and_server_cursors_without_marking(
     matrix: tuple[MatrixRooms, RoomEndpoint],
 ) -> None:
@@ -327,26 +210,21 @@ async def test_unread_returns_counts_mentions_and_server_cursors_without_marking
         "content.m\\.mentions",
         "content.name",
         "content.unread",
-        "content.algorithm",
-        "content.ciphertext",
-        "content.sender_key",
-        "content.session_id",
-        "content.device_id",
     ]
     assert sync_filter["room"]["timeline"]["limit"] == 7
-    assert sync_filter["room"]["timeline"]["types"] == ["m.room.message", "m.room.encrypted"]
+    assert sync_filter["room"]["timeline"]["types"] == ["m.room.message"]
     assert request["query"]["set_presence"] == "offline"
     assert [request["method"] for request in endpoint.requests] == ["GET"]
 
 
-@pytest.mark.parametrize("method", ["invitations", "unread"])
+@pytest.mark.parametrize("method", ["unread", "members"])
 @pytest.mark.parametrize("arguments", [{"limit": 0}, {"limit": 101}, {"offset": -1}])
 async def test_sync_page_bounds_reject_before_http(
     matrix: tuple[MatrixRooms, RoomEndpoint], method: str, arguments: dict[str, int]
 ) -> None:
     rooms, endpoint = matrix
     with pytest.raises(ValueError, match="limit"):
-        await getattr(rooms, method)(**arguments)
+        await getattr(rooms, method)(*([ROOM] if method == "members" else []), **arguments)
     assert not endpoint.requests
 
 
@@ -357,74 +235,110 @@ async def test_malformed_sync_is_an_error(matrix: tuple[MatrixRooms, RoomEndpoin
         await rooms.unread()
 
 
-async def test_too_many_invitees_does_not_create_room(
+async def test_whoami_asks_the_homeserver(matrix: tuple[MatrixRooms, RoomEndpoint]) -> None:
+    rooms, endpoint = matrix
+    endpoint.responses[("GET", "/_matrix/client/v3/account/whoami")] = (
+        {"user_id": "@alice:example.com", "device_id": "TESTDEVICE"},
+        200,
+    )
+
+    assert await rooms.whoami() == {"user_id": "@alice:example.com", "device_id": "TESTDEVICE"}
+    assert endpoint.requests[0]["headers"]["Authorization"] == "Bearer test-token"
+
+
+async def test_list_rooms_names_each_room_and_tolerates_unnamed_ones(
     matrix: tuple[MatrixRooms, RoomEndpoint],
 ) -> None:
     rooms, endpoint = matrix
-    with pytest.raises(ValueError, match="100 invitees"):
-        await rooms.create(invite=[f"@user{number}:example.com" for number in range(101)])
-    assert not endpoint.requests
+    endpoint.responses[("GET", "/_matrix/client/v3/joined_rooms")] = (
+        {"joined_rooms": ["!b:example.com", ROOM]},
+        200,
+    )
+    endpoint.responses[("GET", f"{ROOM_PATH}/state/m.room.name/")] = ({"name": "Planning"}, 200)
+
+    listed = await rooms.list_rooms()
+
+    assert [(room.room_id, room.name) for room in listed] == [
+        ("!b:example.com", None),
+        (ROOM, "Planning"),
+    ]
 
 
-class MentionCrypto:
-    def __init__(self) -> None:
-        self.decrypted: list[str] = []
-
-    async def decrypt(self, room_id: str, raw: dict[str, Any]) -> DecryptedEvent:
-        assert room_id == ROOM
-        self.decrypted.append(raw["event_id"])
-        content = {
-            "msgtype": "m.text",
-            "body": "Encrypted question",
-            "m.mentions": {"user_ids": ["@alice:example.com"]},
-        }
-        return DecryptedEvent({**raw, "type": "m.room.message", "content": content})
-
-    async def encrypt(
-        self, room_id: str, event_type: str, content: dict[str, Any]
-    ) -> tuple[str, dict[str, Any]]:
-        del room_id, event_type, content
-        raise AssertionError
-
-
-@pytest.mark.parametrize("mode", ["local", "hosted"])
-async def test_unread_reads_mentions_inside_encrypted_messages(
-    matrix: tuple[MatrixRooms, RoomEndpoint], mode: str
+async def test_list_rooms_refuses_more_than_its_room_cap(
+    matrix: tuple[MatrixRooms, RoomEndpoint],
 ) -> None:
     rooms, endpoint = matrix
-    crypto = MentionCrypto()
-    if mode == "local":
-        rooms.crypto = crypto
-    sealed = {
-        "event_id": "$sealed",
-        "sender": "@bob:example.com",
-        "origin_server_ts": 123,
-        "type": "m.room.encrypted",
-        "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque"},
-    }
-    endpoint.responses[("GET", "/_matrix/client/v3/sync")] = (
+    endpoint.responses[("GET", "/_matrix/client/v3/joined_rooms")] = (
+        {"joined_rooms": [f"!r{number}:example.com" for number in range(501)]},
+        200,
+    )
+
+    with pytest.raises(RuntimeError, match="500"):
+        await rooms.list_rooms()
+
+    assert len(endpoint.requests) == 1
+
+
+async def test_room_state_errors_other_than_not_found_are_raised(
+    matrix: tuple[MatrixRooms, RoomEndpoint],
+) -> None:
+    rooms, endpoint = matrix
+    endpoint.responses[("GET", f"{ROOM_PATH}/state/m.room.name/")] = (
+        {"errcode": "M_FORBIDDEN", "error": "secret server text"},
+        403,
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP 403") as raised:
+        await rooms.info(ROOM)
+
+    assert "secret server text" not in str(raised.value)
+
+
+async def test_members_are_sorted_and_paged(matrix: tuple[MatrixRooms, RoomEndpoint]) -> None:
+    rooms, endpoint = matrix
+    endpoint.responses[("GET", f"{ROOM_PATH}/joined_members")] = (
         {
-            "next_batch": "next",
-            "rooms": {
-                "join": {
-                    ROOM: {
-                        "timeline": {"events": [sealed]},
-                        "unread_notifications": {"notification_count": 1},
-                    },
-                    "!read:example.com": {"timeline": {"events": [sealed]}},
-                }
-            },
+            "joined": {
+                "@carol:example.com": {"display_name": "Carol"},
+                "@alice:example.com": {"display_name": "Alice", "avatar_url": "mxc://e/a"},
+                "@bob:example.com": {},
+            }
         },
         200,
     )
 
-    page = await rooms.unread()
+    page = await rooms.members(ROOM, limit=2, offset=1)
 
-    mentions = page.rooms[0].mentions
-    if mode == "local":
-        assert [(event.event_id, event.body) for event in mentions] == [
-            ("$sealed", "Encrypted question")
-        ]
-        assert crypto.decrypted == ["$sealed"]
-    else:
-        assert mentions == []
+    assert [member.user_id for member in page.members] == [
+        "@bob:example.com",
+        "@carol:example.com",
+    ]
+    assert page.total == 3
+    assert page.next_offset is None
+
+
+@pytest.mark.parametrize("user_id", ["alice", "@alice:example.com/../x", "@alice"])
+async def test_profile_rejects_invalid_user_ids_before_http(
+    matrix: tuple[MatrixRooms, RoomEndpoint], user_id: str
+) -> None:
+    rooms, endpoint = matrix
+
+    with pytest.raises(ValueError, match="Invalid Matrix"):
+        await rooms.profile(user_id)
+
+    assert not endpoint.requests
+
+
+async def test_avatar_urls_that_are_not_mxc_become_null(
+    matrix: tuple[MatrixRooms, RoomEndpoint],
+) -> None:
+    rooms, endpoint = matrix
+    endpoint.responses[("GET", "/_matrix/client/v3/profile/@bob:example.com")] = (
+        {"displayname": "Bob", "avatar_url": "https://tracker.example.com/pixel.gif"},
+        200,
+    )
+
+    profile = await rooms.profile("@bob:example.com")
+
+    assert profile.avatar_url is None
+    assert profile.displayname == "Bob"

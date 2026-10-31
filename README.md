@@ -1,101 +1,70 @@
-<div align="center">
+# matrix-mcp (hub fork)
 
-<picture>
-  <source media="(prefers-reduced-motion: no-preference)" srcset="https://raw.githubusercontent.com/mindroom-ai/matrix-mcp/main/docs/assets/logo.svg" />
-  <img src="https://raw.githubusercontent.com/mindroom-ai/matrix-mcp/main/docs/assets/logo-static.svg" alt="Matrix MCP logo" width="128" />
-</picture>
+A cut-down, hardened fork of [mindroom-ai/matrix-mcp](https://github.com/mindroom-ai/matrix-mcp)
+v0.9.1 (MIT), for one job: let Claude Code read a self-hosted, unencrypted Matrix homeserver whose
+rooms are bridged from other chat networks, and write in it only when its user asks.
 
-# Matrix MCP
+Messages in those rooms come from strangers. So this fork removes everything that isn't needed
+for that job, and fixes the problems a security review of v0.9.1 found (the review lives with the
+deployment plan, not in this repo).
 
-**Give your AI agent a seat in every Matrix room.**
+## What it does
 
-A full-featured [MCP](https://modelcontextprotocol.io/) server for [Matrix](https://matrix.org/).
-Claude Code, Codex, and any other MCP client can catch up on your rooms, read threads and history, reply, share files, and manage rooms, including end-to-end encrypted ones.
+Fourteen tools, all taking raw Matrix IDs (`!room`, `$event`, `@user`):
 
-[![PyPI](https://img.shields.io/pypi/v/matrix-mcp.svg)](https://pypi.org/project/matrix-mcp/)
-[![Python Versions](https://img.shields.io/pypi/pyversions/matrix-mcp.svg)](https://pypi.org/project/matrix-mcp/)
-[![CI](https://github.com/mindroom-ai/matrix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mindroom-ai/matrix-mcp/actions/workflows/ci.yml)
-[![Docs](https://img.shields.io/badge/docs-matrix--mcp.mindroom.chat-0b6f86)](https://matrix-mcp.mindroom.chat/)
-[![MCP](https://img.shields.io/badge/MCP-server-0b6f86)](https://modelcontextprotocol.io/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/mindroom-ai/matrix-mcp/blob/main/LICENSE)
+| Read (9) | Write (5) |
+| --- | --- |
+| `matrix_whoami`, `matrix_list_rooms`, `matrix_get_room_info`, `matrix_list_room_members`, `matrix_get_profile`, `matrix_read_history`, `matrix_get_event_context`, `matrix_read_thread`, `matrix_get_unread` | `matrix_send_message` (plain text only), `matrix_reply`, `matrix_react`, `matrix_edit_message` (own messages), `matrix_mark_read` (private receipt by default) |
 
-**[Documentation](https://matrix-mcp.mindroom.chat/)** ·
-[Getting Started](https://matrix-mcp.mindroom.chat/getting-started/) ·
-[Tool Reference](https://matrix-mcp.mindroom.chat/usage/) ·
-[Encryption](https://matrix-mcp.mindroom.chat/encryption/) ·
-[Hosted Mode](https://matrix-mcp.mindroom.chat/hosted/)
+Text written by other people (message bodies, room names, topics, display names, file names) is
+labelled as untrusted in every output schema and in the server instructions.
 
-</div>
+## What changed from upstream v0.9.1
 
-## Quick Start
+- **Removed:** sending local files (`file_path`), media upload, download and send, numeric room and
+  event references, redaction, joining, leaving, creating rooms, invitations, user search, room and
+  profile changes, end-to-end encryption, the hosted HTTP/OAuth mode, SSO login, HTTP header
+  commands, and the `matrix-nio` / `mindroom-nio` dependency.
+- **Every request goes through one bounded HTTP layer:** no redirects, no proxy settings from the
+  environment, 2 MiB response cap, bounded retries, a 60-second deadline per call, server error
+  text never passed through. A send that gets no response says it may have been sent and gives the
+  transaction ID that makes a retry safe.
+- **Fields copied from events must look like what they claim** (event IDs, `mxc://` URLs, MIME
+  types, msgtypes), or they come back null.
+- **Homeserver URL:** https only, except plain http to localhost or a single-label container name.
+- **Credentials:** written 0600 in a 0700 folder; the server refuses to load a token file that is a
+  symlink, owned by someone else, or readable by others, or one in a folder others can write to;
+  it reads through one no-follow descriptor, capped at 64 KiB. Config errors name the bad field
+  but never echo its value. Tokens and passwords are prompted for and can't be passed as flags.
+  `auth logout` revokes the token on the homeserver before deleting it.
+- **Runtime:** stdio only, no FastMCP banner, no PyPI update check, and no `.env` file read from
+  the working directory.
+- **Supply chain:** fresh lock (OSV-clean when made), `fastmcp>=3.4.10,<4`, pinned build backend,
+  CI actions pinned by commit SHA, an OSV check in CI, and a Dockerfile that builds from source
+  with uv's locked hashes. Nothing is published to PyPI or a registry.
+
+## Use
 
 ```bash
-uv tool install matrix-mcp
-matrix-mcp auth sso https://mindroom.chat   # your homeserver; opens a browser for SSO
-
-claude mcp add matrix -- matrix-mcp serve   # Claude Code
-codex mcp add matrix -- matrix-mcp serve    # Codex
+uv sync --locked
+uv run matrix-mcp auth password https://hub.example.ts.net alice   # prompts for the password
+claude mcp add matrix -- /path/to/matrix-mcp/.venv/bin/matrix-mcp serve
 ```
 
-Then ask your agent *"What did I miss in the release room?"*
-
-The server talks to your MCP client over stdio and opens no local port.
-[Getting Started](https://matrix-mcp.mindroom.chat/getting-started/) covers SSO providers, logging in over SSH or on a headless machine, password and access-token login, and homeservers behind access gateways such as Cloudflare Access.
-
-## What You Can Ask
-
-| Ask your agent | Tools it reaches for |
-| --- | --- |
-| *"Catch me up: which rooms need me, and what was I mentioned in?"* | `matrix_get_unread`, `matrix_read_thread` |
-| *"Read the deploy thread and reply with the fix I just pushed."* | `matrix_read_thread`, `matrix_send_message` |
-| *"Post `coverage.html` to the CI room and ask the reviewer to take a look."* | `matrix_send_message` |
-| *"Download the screenshot Alice posted and tell me what's broken."* | `matrix_read_room_recent`, `matrix_download_media` |
-| *"Spin up a room for this incident and invite Bob and Carol."* | `matrix_create_room`, `matrix_search_users` |
-| *"Find where we picked the release date and show me the discussion around it."* | `matrix_read_history`, `matrix_get_event_context` |
-
-## Highlights
-
-- 🧰 **30 tools.** Reading, threads, history, unread catch-up, replies, reactions, edits, redactions, invitations, rooms, profiles, and media.
-- 🔒 **End-to-end encryption.** Matrix MCP is its own Matrix device: encrypted rooms just work, files included, and older keys import from Element.
-- 🔑 **Every login your server allows.** Matrix SSO (even over SSH), password, login token, or access token, including homeservers behind Cloudflare Access and other gateways.
-- 🌐 **Local or hosted.** stdio for local agents, or [authenticated HTTP](https://matrix-mcp.mindroom.chat/hosted/) where every user signs in with their own Matrix account through OAuth and Matrix SSO. Container images on GHCR.
-- #️⃣ **Light on context.** Rooms and events get short numeric refs, so agents write `room_id=3` instead of copying long Matrix IDs.
-- 🛡️ **Careful by design.** Every tool declares whether it writes, reading never marks messages read, receipts are private by default, and transfers are size-bounded.
-
-As far as we know, Matrix MCP is the only Matrix MCP server that runs both as a local server with end-to-end encryption and as a multi-user hosted service where everyone signs in with their own Matrix account.
-
-## Tools
-
-| Area | Tools |
-| --- | --- |
-| Session and rooms | `matrix_whoami`, `matrix_list_rooms`, `matrix_get_room_info`, `matrix_set_room_name`, `matrix_set_room_topic`, `matrix_set_room_avatar` |
-| Reading | `matrix_read_room_recent`, `matrix_read_thread`, `matrix_read_history`, `matrix_get_event_context` |
-| Writing | `matrix_send_message`, `matrix_reply`, `matrix_react`, `matrix_edit_message`, `matrix_redact_event` |
-| Membership | `matrix_list_room_members`, `matrix_search_users`, `matrix_invite_user`, `matrix_list_invitations`, `matrix_join_room`, `matrix_leave_room`, `matrix_create_room` |
-| Profile | `matrix_get_profile`, `matrix_set_display_name`, `matrix_set_avatar` |
-| Media | `matrix_upload_media`, `matrix_download_media`, `matrix_send_media` |
-| Catch-up | `matrix_get_unread`, `matrix_mark_read` |
-
-All actions use the connected account's Matrix permissions.
-The [Tool Reference](https://matrix-mcp.mindroom.chat/usage/) has arguments, examples, and limits for each tool.
+`matrix-mcp auth token HOMESERVER USER_ID DEVICE_ID` stores an existing token (prompted for).
+`matrix-mcp auth logout` revokes and removes it; `--local-only` removes it even when the server
+can't be reached.
 
 ## Development
 
 ```bash
-uv sync --extra dev
+uv sync --locked --extra dev
 uv run pytest
+uv run ruff check . && uv run ruff format --check .
+uv run mypy src tests && uv run ty check
+python3 -I .github/scripts/osv_check.py uv.lock
 ```
 
-See [Contributing](https://matrix-mcp.mindroom.chat/contributing/) for linting, type checks, docs, and releases.
+## License
 
-## Built by MindRoom
-
-<a href="https://mindroom.chat"><img src="https://raw.githubusercontent.com/mindroom-ai/matrix-mcp/main/docs/assets/mindroom.png" alt="MindRoom logo" width="64" align="left" /></a>
-
-Matrix MCP is built by [MindRoom](https://mindroom.chat), open-source AI agents that live in Matrix.
-We use it to bring our local coding agents into the same rooms as our teammates and our MindRoom agents.
-It works with any Matrix homeserver; no MindRoom account needed.
-
-<br clear="left" />
-
-MIT licensed.
+MIT, as upstream. Copyright notices for the original work are in [LICENSE](LICENSE).

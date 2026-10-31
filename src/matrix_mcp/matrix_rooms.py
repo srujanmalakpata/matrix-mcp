@@ -1,21 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
 
 from pydantic import BaseModel, Field, ValidationError
 
-from matrix_mcp.matrix_http import quote_matrix_id
+from matrix_mcp.matrix_events import UNTRUSTED_TEXT
+from matrix_mcp.matrix_http import MatrixHTTPError, quote_matrix_id
 
 if TYPE_CHECKING:
-    from matrix_mcp.e2ee import RoomCrypto
     from matrix_mcp.matrix_http import MatrixHTTP
 
 
 _MAX_PAGE = 100
-_MAX_INVITEES = 100
+_MAX_ROOMS = 500
+_ROOM_NAME_CONCURRENCY = 8
+_MXC_URI = re.compile(r"mxc://[A-Za-z0-9.:\[\]-]{1,255}/[A-Za-z0-9_-]{1,255}")
 _SYNC_EVENT_FIELDS = [
     "event_id",
     "sender",
@@ -27,24 +31,28 @@ _SYNC_EVENT_FIELDS = [
     "content.name",
     "content.unread",
 ]
-# Unread timelines keep Megolm fields so encrypted mentions can be decrypted.
-_MEGOLM_EVENT_FIELDS = [
-    "content.algorithm",
-    "content.ciphertext",
-    "content.sender_key",
-    "content.session_id",
-    "content.device_id",
-]
 
 
-class Invitation(BaseModel):
+class Room(BaseModel):
     room_id: str
-    name: str | None = None
-    inviter: str | None = None
+    name: str | None = Field(default=None, description=UNTRUSTED_TEXT)
 
 
-class InvitationPage(BaseModel):
-    rooms: list[Invitation]
+class RoomInfo(BaseModel):
+    room_id: str
+    name: str | None = Field(default=None, description=UNTRUSTED_TEXT)
+    topic: str | None = Field(default=None, description=UNTRUSTED_TEXT)
+    avatar_url: str | None = None
+
+
+class Profile(BaseModel):
+    user_id: str
+    displayname: str | None = Field(default=None, description=UNTRUSTED_TEXT)
+    avatar_url: str | None = None
+
+
+class MemberPage(BaseModel):
+    members: list[Profile]
     total: int
     next_offset: int | None
 
@@ -52,13 +60,13 @@ class InvitationPage(BaseModel):
 class MentionEvent(BaseModel):
     event_id: str
     sender: str
-    body: str | None = None
+    body: str | None = Field(default=None, description=UNTRUSTED_TEXT)
     timestamp_ms: int | None = None
 
 
 class UnreadRoom(BaseModel):
     room_id: str
-    name: str | None = None
+    name: str | None = Field(default=None, description=UNTRUSTED_TEXT)
     notification_count: int = Field(
         description="Current homeserver count, which depends on push rules."
     )
@@ -100,7 +108,6 @@ class _Counts(BaseModel):
 
 class _RoomData(BaseModel):
     state: _EventBatch = Field(default_factory=_EventBatch)
-    invite_state: _EventBatch = Field(default_factory=_EventBatch)
     account_data: _EventBatch = Field(default_factory=_EventBatch)
     timeline: _Timeline = Field(default_factory=_Timeline)
     unread_notifications: _Counts = Field(default_factory=_Counts)
@@ -108,7 +115,6 @@ class _RoomData(BaseModel):
 
 class _Rooms(BaseModel):
     join: dict[str, _RoomData] = Field(default_factory=dict)
-    invite: dict[str, _RoomData] = Field(default_factory=dict)
 
 
 class _Sync(BaseModel):
@@ -117,72 +123,91 @@ class _Sync(BaseModel):
 
 
 class MatrixRooms:
-    def __init__(self, http: MatrixHTTP, crypto: RoomCrypto | None = None) -> None:
+    def __init__(self, http: MatrixHTTP) -> None:
         self.http = http
-        self.crypto = crypto
 
-    async def invitations(self, *, limit: int = 50, offset: int = 0) -> InvitationPage:
+    async def whoami(self) -> dict[str, str | None]:
+        payload = await self.http.json("GET", "/_matrix/client/v3/account/whoami")
+        user_id = payload.get("user_id")
+        device_id = payload.get("device_id")
+        if not isinstance(user_id, str) or not isinstance(device_id, (str, type(None))):
+            msg = "Matrix returned an invalid whoami response"
+            raise RuntimeError(msg)  # noqa: TRY004 - Invalid upstream response.
+        return {"user_id": user_id, "device_id": device_id}
+
+    async def list_rooms(self) -> list[Room]:
+        """Joined rooms with their names, reading at most 500 rooms, 8 at a time."""
+        payload = await self.http.json("GET", "/_matrix/client/v3/joined_rooms")
+        room_ids = payload.get("joined_rooms")
+        if not isinstance(room_ids, list) or not all(isinstance(room, str) for room in room_ids):
+            msg = "Matrix returned an invalid joined_rooms response"
+            raise RuntimeError(msg)
+        if len(room_ids) > _MAX_ROOMS:
+            msg = f"More than {_MAX_ROOMS} joined rooms; refusing to list them all"
+            raise RuntimeError(msg)
+        limit = asyncio.Semaphore(_ROOM_NAME_CONCURRENCY)
+
+        async def named(room_id: str) -> Room:
+            async with limit:
+                return Room(room_id=room_id, name=await self._state(room_id, "m.room.name", "name"))
+
+        return list(await asyncio.gather(*(named(room_id) for room_id in sorted(room_ids))))
+
+    async def info(self, room_id: str) -> RoomInfo:
+        name, topic, avatar_url = await asyncio.gather(
+            self._state(room_id, "m.room.name", "name"),
+            self._state(room_id, "m.room.topic", "topic"),
+            self._state(room_id, "m.room.avatar", "url"),
+        )
+        return RoomInfo(room_id=room_id, name=name, topic=topic, avatar_url=_mxc(avatar_url))
+
+    async def members(self, room_id: str, *, limit: int = 100, offset: int = 0) -> MemberPage:
         _validate_page(limit, offset)
-        snapshot = await self._sync(timeline_limit=1, include_invites=True)
-        invitations = []
-        for room_id, room in sorted(snapshot.rooms.invite.items()):
-            events = room.invite_state.events
-            membership = next(
-                (
-                    event
-                    for event in events
-                    if event.get("type") == "m.room.member"
-                    and event.get("state_key") == self.http.user_id
-                ),
-                {},
-            )
-            invitations.append(
-                Invitation(
-                    room_id=room_id,
-                    name=_state_value(events, "m.room.name", "name"),
-                    inviter=_string(membership.get("sender")),
-                )
-            )
-        return InvitationPage(
-            rooms=invitations[offset : offset + limit],
-            total=len(invitations),
-            next_offset=_next_offset(len(invitations), offset, limit),
-        )
-
-    async def join(self, room_id_or_alias: str) -> str:
-        target = _identifier(room_id_or_alias, sigils="!#")
-        result = await self.http.json("POST", f"/_matrix/client/v3/join/{target}", body={})
-        return _room_result(result)
-
-    async def leave(self, room_id: str, *, reason: str | None = None) -> None:
         room = _identifier(room_id, sigils="!")
-        body: dict[str, object] = {} if reason is None else {"reason": reason}
-        await self.http.json("POST", f"/_matrix/client/v3/rooms/{room}/leave", body=body)
+        payload = await self.http.json("GET", f"/_matrix/client/v3/rooms/{room}/joined_members")
+        joined = payload.get("joined")
+        if not isinstance(joined, dict):
+            msg = "Matrix returned an invalid joined_members response"
+            raise RuntimeError(msg)  # noqa: TRY004 - Invalid upstream response.
+        profiles = sorted(
+            (
+                Profile(
+                    user_id=user_id,
+                    displayname=_string(_content_of(member).get("display_name")),
+                    avatar_url=_mxc(_content_of(member).get("avatar_url")),
+                )
+                for user_id, member in joined.items()
+                if isinstance(user_id, str)
+            ),
+            key=lambda profile: profile.user_id,
+        )
+        return MemberPage(
+            members=profiles[offset : offset + limit],
+            total=len(profiles),
+            next_offset=_next_offset(len(profiles), offset, limit),
+        )
 
-    async def create(
-        self,
-        *,
-        name: str | None = None,
-        topic: str | None = None,
-        invite: list[str] | None = None,
-    ) -> str:
-        if invite is not None:
-            if len(invite) > _MAX_INVITEES:
-                msg = "At most 100 invitees are supported"
-                raise ValueError(msg)
-            for user_id in invite:
-                _identifier(user_id, sigils="@")
-        body: dict[str, object] = {"visibility": "private", "preset": "private_chat"}
-        body.update(
-            {
-                key: value
-                for key, value in (("name", name), ("topic", topic), ("invite", invite))
-                if value is not None
-            }
+    async def profile(self, user_id: str | None = None) -> Profile:
+        target = self.http.user_id if user_id is None else user_id
+        user = _identifier(target, sigils="@")
+        payload = await self.http.json("GET", f"/_matrix/client/v3/profile/{user}")
+        return Profile(
+            user_id=target,
+            displayname=_string(payload.get("displayname")),
+            avatar_url=_mxc(payload.get("avatar_url")),
         )
-        return _room_result(
-            await self.http.json("POST", "/_matrix/client/v3/createRoom", body=body)
-        )
+
+    async def _state(self, room_id: str, event_type: str, key: str) -> str | None:
+        room = _identifier(room_id, sigils="!")
+        try:
+            payload = await self.http.json(
+                "GET", f"/_matrix/client/v3/rooms/{room}/state/{event_type}/"
+            )
+        except MatrixHTTPError as exc:
+            if exc.status_code == HTTPStatus.NOT_FOUND and exc.errcode == "M_NOT_FOUND":
+                return None
+            raise
+        return _string(payload.get(key))
 
     async def unread(
         self,
@@ -212,10 +237,7 @@ class MatrixRooms:
                     notification_count=counts.notification_count,
                     highlight_count=counts.highlight_count,
                     marked_unread=marked,
-                    mentions=_mentions(
-                        await self._readable(room_id, room.timeline.events[:timeline_limit]),
-                        self.http.user_id,
-                    ),
+                    mentions=_mentions(room.timeline.events[:timeline_limit], self.http.user_id),
                     limited=room.timeline.limited or len(room.timeline.events) > timeline_limit,
                     prev_batch=room.timeline.prev_batch,
                 )
@@ -262,39 +284,18 @@ class MatrixRooms:
             )
             raise RuntimeError(msg) from None
 
-    async def _readable(self, room_id: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if self.crypto is None:
-            return events
-        readable = []
-        for event in events:
-            if event.get("type") == "m.room.encrypted":
-                event = (await self.crypto.decrypt(room_id, event)).event  # noqa: PLW2901
-            readable.append(event)
-        return readable
-
     async def _sync(
         self,
         *,
         timeline_limit: int,
-        include_invites: bool = False,
     ) -> _Sync:
         sync_filter = {
-            "event_fields": _SYNC_EVENT_FIELDS
-            if include_invites
-            else [*_SYNC_EVENT_FIELDS, *_MEGOLM_EVENT_FIELDS],
+            "event_fields": _SYNC_EVENT_FIELDS,
             "presence": {"types": []},
             "account_data": {"types": []},
             "room": {
-                "state": {
-                    "types": ["m.room.name", "m.room.member"]
-                    if include_invites
-                    else ["m.room.name"],
-                    "lazy_load_members": True,
-                },
-                "timeline": {
-                    "limit": timeline_limit,
-                    "types": [] if include_invites else ["m.room.message", "m.room.encrypted"],
-                },
+                "state": {"types": ["m.room.name"], "lazy_load_members": True},
+                "timeline": {"limit": timeline_limit, "types": ["m.room.message"]},
                 "ephemeral": {"types": []},
                 "account_data": {"types": ["m.marked_unread"]},
             },
@@ -321,15 +322,6 @@ def _identifier(value: str, *, sigils: str) -> str:
     return quote(value, safe="")
 
 
-def _room_result(result: dict[str, Any]) -> str:
-    room_id = result.get("room_id")
-    if not isinstance(room_id, str):
-        msg = "Matrix returned an invalid room ID"
-        raise RuntimeError(msg)  # noqa: TRY004 - Invalid upstream response, not caller input.
-    _identifier(room_id, sigils="!")
-    return room_id
-
-
 def _validate_page(limit: int, offset: int) -> None:
     if not 1 <= limit <= _MAX_PAGE or offset < 0:
         msg = "limit must be between 1 and 100 and offset must be nonnegative"
@@ -344,6 +336,18 @@ def _next_offset(total: int, offset: int, limit: int) -> int | None:
 def _content(event: dict[str, Any]) -> dict[str, Any]:
     content = event.get("content")
     return cast("dict[str, Any]", content) if isinstance(content, dict) else {}
+
+
+def _content_of(value: object) -> dict[str, Any]:
+    return cast("dict[str, Any]", value) if isinstance(value, dict) else {}
+
+
+def _integer(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _mxc(value: object) -> str | None:
+    return value if isinstance(value, str) and _MXC_URI.fullmatch(value) else None
 
 
 def _string(value: object) -> str | None:
@@ -377,7 +381,7 @@ def _mentions(events: list[dict[str, Any]], user_id: str) -> list[MentionEvent]:
                     event_id=event["event_id"],
                     sender=event["sender"],
                     body=_string(content.get("body")),
-                    timestamp_ms=event.get("origin_server_ts"),
+                    timestamp_ms=_integer(event.get("origin_server_ts")),
                 )
             )
     return mentions

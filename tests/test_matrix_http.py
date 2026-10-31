@@ -10,7 +10,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from matrix_mcp.config import MatrixMCPConfig
-from matrix_mcp.matrix_http import MatrixHTTP, MatrixHTTPError
+from matrix_mcp.matrix_http import MatrixHTTP, MatrixHTTPError, post_json
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -78,7 +78,6 @@ async def matrix_http() -> AsyncIterator[tuple[MatrixHTTP, MatrixEndpoint]]:
             user_id="@alice:example.com",
             device_id="TESTDEVICE",
             access_token="test-token",
-            http_headers={"X-Example": "custom-value"},
         )
         yield MatrixHTTP(config), endpoint
 
@@ -108,7 +107,6 @@ async def test_json_preserves_homeserver_prefix_auth_headers_query_and_body(
         }
     ]
     assert endpoint.requests[0]["headers"]["Authorization"] == "Bearer test-token"
-    assert endpoint.requests[0]["headers"]["X-Example"] == "custom-value"
     assert endpoint.requests[0]["headers"]["Accept-Encoding"] == "identity"
 
 
@@ -265,40 +263,6 @@ async def test_json_retries_only_two_explicit_rate_limits(
     assert [request["body"] for request in endpoint.requests] == [{"body": "same"}] * 3
 
 
-async def test_json_sends_raw_content_with_request_headers(
-    matrix_http: tuple[MatrixHTTP, MatrixEndpoint],
-) -> None:
-    http, endpoint = matrix_http
-    endpoint.respond("POST", f"{ROOM_PATH}/messages", {"event_id": "$upload"})
-
-    payload = await http.json(
-        "POST",
-        "/_matrix/client/v3/rooms/%21room%3Aexample.com/messages",
-        content=b"payload",
-        headers={"Content-Type": "application/octet-stream"},
-    )
-
-    assert payload == {"event_id": "$upload"}
-    assert endpoint.requests[0]["body"] == b"payload"
-    assert endpoint.requests[0]["headers"]["Content-Type"] == "application/octet-stream"
-
-
-async def test_json_rejects_json_body_with_raw_content(
-    matrix_http: tuple[MatrixHTTP, MatrixEndpoint],
-) -> None:
-    http, endpoint = matrix_http
-
-    with pytest.raises(ValueError, match=r"body.*content"):
-        await http.json(
-            "POST",
-            "/_matrix/client/v3/rooms/%21room%3Aexample.com/messages",
-            body={"body": "json"},
-            content=b"raw",
-        )
-
-    assert endpoint.requests == []
-
-
 async def test_json_respects_http_date_retry_after(
     matrix_http: tuple[MatrixHTTP, MatrixEndpoint], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -439,29 +403,60 @@ def test_constructor_requires_credentials() -> None:
 
 
 @pytest.mark.parametrize("suffix", ["?tenant=example", "?", "#fragment", "#"])
-def test_constructor_rejects_homeserver_query_and_fragment(suffix: str) -> None:
-    config = MatrixMCPConfig(
-        homeserver=f"https://matrix.example.com/prefix{suffix}",
-        user_id="@alice:example.com",
-        access_token="test-token",
-    )
-
+def test_config_rejects_homeserver_query_and_fragment(suffix: str) -> None:
     with pytest.raises(ValueError, match=r"query|fragment"):
-        MatrixHTTP(config)
+        MatrixMCPConfig(
+            homeserver=f"https://matrix.example.com/prefix{suffix}",
+            user_id="@alice:example.com",
+            access_token="test-token",
+        )
 
 
-def test_client_sanitizes_custom_header_command_failure() -> None:
-    marker = "synthetic-sensitive-marker"
-    config = MatrixMCPConfig(
-        homeserver="https://matrix.example.com",
-        user_id="@alice:example.com",
-        access_token="test-token",
-        http_header_commands={"X-Example": f"/bin/sh -c 'printf {marker} >&2; exit 1'"},
+async def test_client_ignores_proxy_settings_from_the_environment(
+    matrix_http: tuple[MatrixHTTP, MatrixEndpoint], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    http, endpoint = matrix_http
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9")
+    endpoint.respond("GET", "/prefix/_matrix/client/v3/account/whoami", {"user_id": "@a:b"})
+
+    assert await http.json("GET", "/_matrix/client/v3/account/whoami") == {"user_id": "@a:b"}
+
+
+async def test_post_json_sends_no_token_unless_given(
+    matrix_http: tuple[MatrixHTTP, MatrixEndpoint],
+) -> None:
+    http, endpoint = matrix_http
+    endpoint.respond("POST", "/prefix/_matrix/client/v3/login", {"ok": True})
+    endpoint.respond("POST", "/prefix/_matrix/client/v3/logout", {})
+    homeserver = http._homeserver  # noqa: SLF001 - The fixture's server URL.
+
+    assert await post_json(homeserver, "/_matrix/client/v3/login", {"x": 1}) == {"ok": True}
+    await post_json(homeserver, "/_matrix/client/v3/logout", {}, access_token="secret")
+
+    assert "Authorization" not in endpoint.requests[0]["headers"]
+    assert endpoint.requests[0]["body"] == {"x": 1}
+    assert endpoint.requests[1]["headers"]["Authorization"] == "Bearer secret"
+
+
+async def test_post_json_refuses_redirects_and_hides_server_error_text(
+    matrix_http: tuple[MatrixHTTP, MatrixEndpoint],
+) -> None:
+    http, endpoint = matrix_http
+    homeserver = http._homeserver  # noqa: SLF001 - The fixture's server URL.
+    endpoint.respond(
+        "POST", "/prefix/_matrix/client/v3/login", {}, status=307, headers={"Location": "/x"}
     )
-    http = MatrixHTTP(config)
+    endpoint.respond(
+        "POST",
+        "/prefix/_matrix/client/v3/login",
+        {"errcode": "M_FORBIDDEN", "error": "token=leaked-secret"},
+        status=403,
+    )
 
-    with pytest.raises(RuntimeError, match="header") as caught:
-        http.client()
+    with pytest.raises(MatrixHTTPError, match="redirect"):
+        await post_json(homeserver, "/_matrix/client/v3/login", {})
+    with pytest.raises(MatrixHTTPError, match=r"HTTP 403 \(M_FORBIDDEN\)") as raised:
+        await post_json(homeserver, "/_matrix/client/v3/login", {})
 
-    assert marker not in str(caught.value)
-    assert caught.value.__suppress_context__ is True
+    assert "leaked-secret" not in str(raised.value)

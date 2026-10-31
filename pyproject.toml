@@ -1,11 +1,11 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+requires = ["hatchling==1.32.4", "hatch-vcs==0.5.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "matrix-mcp"
 dynamic = ["version"]
-description = "A Matrix MCP server for connecting coding agents to Matrix and MindRoom conversations."
+description = "A cut-down, hardened fork of matrix-mcp: read Matrix rooms; write only text, replies, reactions, edits and read markers."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
@@ -16,11 +16,9 @@ keywords = [
   "ai",
   "claude",
   "codex",
-  "e2ee",
   "matrix",
   "mcp",
   "model-context-protocol",
-  "sso",
 ]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -35,43 +33,27 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-  "anyio>=4",
   "certifi>=2024.2.2",
-  "fastmcp==3.2.4",
-  "cryptography>=45",
-  "filelock>=3.18",
-  "py-key-value-aio[filetree]>=0.4.4",
+  "fastmcp>=3.4.10,<4",
   "httpx>=0.28",
-  "mindroom-nio[e2e]>=0.25.3",
   "platformdirs>=4.3",
   "pydantic>=2.11",
-  "pydantic-settings>=2.9",
-  "rich>=14.0",
   "typer>=0.19",
 ]
 
 [project.urls]
-Homepage = "https://matrix-mcp.mindroom.chat/"
-Documentation = "https://matrix-mcp.mindroom.chat/"
-Repository = "https://github.com/mindroom-ai/matrix-mcp"
-Issues = "https://github.com/mindroom-ai/matrix-mcp/issues"
-Changelog = "https://github.com/mindroom-ai/matrix-mcp/releases"
+Repository = "https://github.com/srujanmalakpata/matrix-mcp"
+Upstream = "https://github.com/mindroom-ai/matrix-mcp"
 
 [project.optional-dependencies]
 dev = [
+  "aiohttp>=3.14",  # test servers only
   "mypy>=1.14",
   "pre-commit>=4",
   "pytest>=8.4",
   "pytest-asyncio>=1.0",
   "ruff>=0.13",
   "ty",
-]
-
-[dependency-groups]
-docs = [
-  "markdown-code-runner>=2.7.0",
-  "markdown-gfm-admonition",
-  "zensical",
 ]
 
 [project.scripts]
@@ -121,6 +103,9 @@ ignore = [
 "src/matrix_mcp/mcp_server.py" = [
   "PLR0913", # MCP tool signatures expose structured tool parameters directly
 ]
+".github/scripts/*" = [
+  "INP001", # standalone CI scripts, not a package
+]
 "tests/*" = [
   "S101",    # assert usage is fine in tests
   "PLR2004", # magic values are fine in tests
@@ -137,14 +122,6 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 packages = ["matrix_mcp"]
-
-[[tool.mypy.overrides]]
-module = ["nio", "nio.*", "peewee"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["authlib.*"]
-ignore_missing_imports = true
 
 [tool.ty.rules]
 unused-ignore-comment = "ignore"

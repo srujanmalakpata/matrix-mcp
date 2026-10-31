@@ -1,78 +1,33 @@
 from __future__ import annotations
 
 import asyncio
-import shlex
-import shutil
-import subprocess
-import webbrowser
+import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING
 
 import typer
 
 if TYPE_CHECKING:
     from matrix_mcp.config import MatrixMCPConfig
-    from matrix_mcp.e2ee import E2EEStatus
-    from matrix_mcp.http_headers import HTTPHeaderConfig
 
-_E2EE_LOCK_TIMEOUT_SECONDS = 60.0
-
-app = typer.Typer(no_args_is_help=True)
-auth_app = typer.Typer(no_args_is_help=True)
+# Never print local variables (passwords, tokens) in tracebacks, whatever Typer's default is.
+app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
+auth_app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
 app.add_typer(auth_app, name="auth")
-e2ee_app = typer.Typer(no_args_is_help=True, help="Manage end-to-end encryption for this device.")
-app.add_typer(e2ee_app, name="e2ee")
 
 
 @app.command()
-def serve(
-    transport: Literal["stdio", "http"] = typer.Option("stdio", help="MCP transport"),
-    host: str = typer.Option("127.0.0.1", help="HTTP listen address"),
-    port: int = typer.Option(8000, min=1, max=65535, help="HTTP listen port"),
-    public_base_url: str | None = typer.Option(None, help="Public HTTPS MCP origin"),
-    homeserver: str | None = typer.Option(None, help="Public Matrix homeserver URL"),
-    api_base_url: str | None = typer.Option(None, help="Optional trusted Matrix API URL"),
-    state_directory: Path | None = typer.Option(None, help="Persistent encrypted OAuth state"),
-    allowed_client_redirect_uri: list[str] | None = typer.Option(
-        None,
-        "--allowed-client-redirect-uri",
-        help="Allowed OAuth callback URI; repeat as needed",
-    ),
-) -> None:
-    """Run stdio, or opt into authenticated HTTP using explicit hosted settings."""
-    if transport == "stdio":
-        from matrix_mcp.mcp_server import create_mcp_server
+def serve() -> None:
+    """Run the MCP server over stdio."""
+    # FastMCP reads these when it is imported: no .env file from the working directory, no PyPI
+    # update check, no banner, stdio only.
+    os.environ["FASTMCP_ENV_FILE"] = os.devnull
+    os.environ["FASTMCP_CHECK_FOR_UPDATES"] = "off"
+    os.environ["FASTMCP_SHOW_SERVER_BANNER"] = "false"
+    os.environ["FASTMCP_TRANSPORT"] = "stdio"
+    from matrix_mcp.mcp_server import create_mcp_server
 
-        create_mcp_server().run()
-        return
-
-    from pydantic import ValidationError
-
-    from matrix_mcp.hosted_auth import HostedSettings
-    from matrix_mcp.hosted_server import create_hosted_server
-
-    overrides: dict[str, Any] = {
-        "public_base_url": public_base_url,
-        "homeserver": homeserver,
-        "api_base_url": api_base_url,
-        "state_directory": state_directory,
-        "allowed_client_redirect_uris": allowed_client_redirect_uri,
-    }
-    try:
-        settings = HostedSettings(
-            **{key: value for key, value in overrides.items() if value is not None}
-        )
-    except ValidationError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    create_hosted_server(settings).run(
-        transport="http",
-        host=host,
-        port=port,
-        path="/mcp",
-        stateless_http=True,
-        uvicorn_config={"access_log": False},
-    )
+    create_mcp_server().run(transport="stdio", show_banner=False)
 
 
 @app.command()
@@ -83,340 +38,99 @@ def config_path() -> None:
 
 @auth_app.command("token")
 def auth_token(
-    homeserver: str = typer.Argument(..., help="Matrix homeserver URL, e.g. https://mindroom.chat"),
-    user_id: str = typer.Argument(..., help="Matrix user ID, e.g. @alice:mindroom.chat"),
-    access_token: str = typer.Argument(..., help="Matrix access token"),
-    device_id: str | None = typer.Option(None, help="Optional Matrix device ID"),
-    header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
-    header_command: list[str] | None = typer.Option(
-        None,
-        "--header-command",
-        help="Command that prints an extra HTTP header value, formatted as 'Name: command'",
-    ),
+    homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
+    user_id: str = typer.Argument(..., help="Matrix user ID, e.g. @alice:example.com"),
+    device_id: str = typer.Argument(..., help="Matrix device ID the token belongs to"),
     config: Path | None = typer.Option(None, "--config", help="Config file to write"),
 ) -> None:
-    """Store an existing Matrix access token."""
-    from matrix_mcp.config import MatrixMCPConfig
+    """Store an existing Matrix access token, which is prompted for and never echoed."""
+    from matrix_mcp.auth import login_result
+    from matrix_mcp.config import validated_homeserver
 
     config_path = _resolve_config_path(config)
-    header_config = _http_header_config(header, header_command)
-    saved = MatrixMCPConfig(
-        homeserver=homeserver.rstrip("/"),
-        user_id=user_id,
-        device_id=device_id,
-        access_token=access_token,
-        http_headers=header_config.headers,
-        http_header_commands=header_config.commands,
-    )
-    saved.save(config_path)
-    typer.echo(f"Saved Matrix MCP credentials to {config_path}")
-    _setup_e2ee(saved)
+    access_token = typer.prompt("Access token", hide_input=True)
+    try:
+        result = login_result(
+            validated_homeserver(homeserver),
+            {"user_id": user_id, "device_id": device_id, "access_token": access_token},
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    result.to_config().save(config_path)
+    typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
 
 
 @auth_app.command("password")
 def auth_password(
     homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
     user: str = typer.Argument(..., help="Matrix user ID or localpart"),
-    password: str = typer.Option(..., prompt=True, hide_input=True, confirmation_prompt=False),
     device_name: str = typer.Option("matrix-mcp", help="Matrix device display name"),
-    header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
-    header_command: list[str] | None = typer.Option(
-        None,
-        "--header-command",
-        help="Command that prints an extra HTTP header value, formatted as 'Name: command'",
-    ),
     config: Path | None = typer.Option(None, "--config", help="Config file to write"),
 ) -> None:
-    """Login using Matrix password auth and store the resulting access token."""
+    """Log in with a password (prompted, never echoed) and store the resulting access token."""
     from matrix_mcp.auth import login_with_password
 
     config_path = _resolve_config_path(config)
-    header_config = _http_header_config(header, header_command)
-    result = asyncio.run(
-        login_with_password(
-            homeserver=homeserver,
-            user=user,
-            password=password,
-            device_name=device_name,
-            header_config=header_config,
-        ),
-    )
-    saved = result.to_config()
-    saved.save(config_path)
-    typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
-    _setup_e2ee(saved)
-
-
-@auth_app.command("sso-url")
-def auth_sso_url(
-    homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
-    redirect_url: str = typer.Argument(..., help="Callback URL that receives loginToken"),
-    idp_id: str | None = typer.Option(None, help="Optional Matrix SSO provider ID"),
-    open_browser: bool = typer.Option(False, "--open", help="Open the SSO URL in a browser"),
-) -> None:
-    """Print a Matrix SSO redirect URL."""
-    from matrix_mcp.auth import build_sso_redirect_url
-
-    url = build_sso_redirect_url(homeserver=homeserver, redirect_url=redirect_url, idp_id=idp_id)
-    typer.echo(url)
-    if open_browser:
-        webbrowser.open(url)
-
-
-@auth_app.command("providers")
-def auth_providers(
-    homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
-    header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
-    header_command: list[str] | None = typer.Option(
-        None,
-        "--header-command",
-        help="Command that prints an extra HTTP header value, formatted as 'Name: command'",
-    ),
-) -> None:
-    """List Matrix SSO provider IDs for a homeserver."""
-    providers = _fetch_sso_providers(
-        homeserver,
-        header_config=_http_header_config(header, header_command),
-    )
-    if not providers:
-        typer.echo("No Matrix SSO providers advertised by this homeserver.")
-        return
-    for provider in providers:
-        label = _provider_label(provider)
-        typer.echo(f"{provider.id}\t{label}")
-
-
-@auth_app.command("sso")
-def auth_sso(
-    homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
-    idp_id: str | None = typer.Option(None, help="Optional Matrix SSO provider ID"),
-    callback_host: str = typer.Option("127.0.0.1", help="Local callback bind host"),
-    callback_port: int = typer.Option(0, help="Local callback bind port; 0 chooses a free port"),
-    device_name: str = typer.Option("matrix-mcp", help="Matrix device display name"),
-    header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
-    header_command: list[str] | None = typer.Option(
-        None,
-        "--header-command",
-        help="Command that prints an extra HTTP header value, formatted as 'Name: command'",
-    ),
-    cloudflare_access: bool = typer.Option(
-        False,
-        "--cloudflare-access",
-        help="Use cloudflared on PATH to provide a Cloudflare Access token header",
-    ),
-    config: Path | None = typer.Option(None, "--config", help="Config file to write"),
-) -> None:
-    """Login through Matrix SSO in a browser and save the resulting access token."""
-    from matrix_mcp.auth import SSOCallbackServer, build_sso_redirect_url, login_with_token
-
-    config_path = _resolve_config_path(config)
-    header_command = _with_cloudflare_access_header_command(
-        homeserver=homeserver,
-        header_values=header,
-        header_command_values=header_command,
-        enabled=cloudflare_access,
-    )
-    if cloudflare_access:
-        _ensure_cloudflare_access_login(homeserver=homeserver)
-    header_config = _http_header_config(
-        header,
-        header_command,
-    )
-    callback = SSOCallbackServer(host=callback_host, port=callback_port)
+    password = typer.prompt("Password", hide_input=True)
     try:
-        url = build_sso_redirect_url(
-            homeserver=homeserver, redirect_url=callback.redirect_url, idp_id=idp_id
-        )
-        typer.echo(f"Opening Matrix SSO URL: {url}")
-        if not webbrowser.open(url):
-            port = urlsplit(callback.redirect_url).port
-            typer.echo(
-                "No browser opened on this machine. If you are connected over SSH, "
-                "forward the callback port from the machine with your browser "
-                f"(ssh -N -L {port}:127.0.0.1:{port} remote-host) and open the URL "
-                "above there. See https://matrix-mcp.mindroom.chat/getting-started/."
-            )
-        login_token = callback.wait_for_token()
         result = asyncio.run(
-            login_with_token(
+            login_with_password(
                 homeserver=homeserver,
-                login_token=login_token,
+                user=user,
+                password=password,
                 device_name=device_name,
-                header_config=header_config,
             ),
         )
-    finally:
-        callback.close()
-    saved = result.to_config()
-    saved.save(config_path)
+    except (RuntimeError, ValueError) as exc:
+        typer.echo(f"Login failed: {exc}", err=True)
+        raise typer.Exit(1) from None
+    result.to_config().save(config_path)
     typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
-    _setup_e2ee(saved)
-
-
-@auth_app.command("login-token")
-def auth_login_token(
-    homeserver: str = typer.Argument(..., help="Matrix homeserver URL"),
-    login_token: str = typer.Argument(..., help="Single-use Matrix m.login.token value"),
-    device_name: str = typer.Option("matrix-mcp", help="Matrix device display name"),
-    header: list[str] | None = typer.Option(None, "--header", "-H", help="Extra HTTP header"),
-    header_command: list[str] | None = typer.Option(
-        None,
-        "--header-command",
-        help="Command that prints an extra HTTP header value, formatted as 'Name: command'",
-    ),
-    config: Path | None = typer.Option(None, "--config", help="Config file to write"),
-) -> None:
-    """Exchange a Matrix SSO loginToken for an access token and save it."""
-    from matrix_mcp.auth import login_with_token
-
-    config_path = _resolve_config_path(config)
-    header_config = _http_header_config(header, header_command)
-    result = asyncio.run(
-        login_with_token(
-            homeserver=homeserver,
-            login_token=login_token,
-            device_name=device_name,
-            header_config=header_config,
-        ),
-    )
-    saved = result.to_config()
-    saved.save(config_path)
-    typer.echo(f"Saved Matrix MCP credentials for {result.user_id} to {config_path}")
-    _setup_e2ee(saved)
 
 
 @auth_app.command("logout")
 def auth_logout(
     config: Path | None = typer.Option(None, "--config", help="Config file to remove"),
+    local_only: bool = typer.Option(
+        False,
+        "--local-only",
+        help="Delete the local file even if the homeserver can't revoke the token",
+    ),
 ) -> None:
-    """Remove stored Matrix MCP credentials."""
-    from filelock import FileLock, Timeout
-
-    from matrix_mcp.e2ee import e2ee_lock_path
+    """Revoke the stored token on the homeserver, then remove the local credentials."""
+    from matrix_mcp.auth import logout
 
     config_path = _resolve_config_path(config)
     if not config_path.exists():
         typer.echo(f"No Matrix MCP credentials found at {config_path}")
         return
-    store = _e2ee_store_for(config_path)
-    if store is None:
-        config_path.unlink()
-        typer.echo(f"Removed Matrix MCP credentials from {config_path}")
-        return
-    # Take the store lock so no tool call is using the keys while they are deleted.
+    saved = _load_credentials(config_path)
     try:
-        with FileLock(e2ee_lock_path(store), timeout=_E2EE_LOCK_TIMEOUT_SECONDS):
-            config_path.unlink()
-            typer.echo(f"Removed Matrix MCP credentials from {config_path}")
-            if store.exists():
-                shutil.rmtree(store)
-                typer.echo(f"Removed end-to-end encryption keys from {store}")
-                typer.echo(
-                    "The device is still registered on the homeserver but can no longer use "
-                    "end-to-end encryption; log in again to get a new device."
-                )
-    except Timeout as exc:
-        typer.echo(
-            "The end-to-end encryption store is in use by a matrix-mcp tool call; "
-            "nothing was removed. Retry the logout.",
-            err=True,
-        )
-        raise typer.Exit(1) from exc
-
-
-@e2ee_app.command("setup")
-def e2ee_setup(
-    config: Path | None = typer.Option(None, "--config", help="Config file to read"),
-) -> None:
-    """Publish this device's encryption keys and show its fingerprint."""
-    from matrix_mcp.e2ee import MatrixE2EE
-
-    settings = _load_credentials(config)
-    try:
-        status = asyncio.run(MatrixE2EE(settings).setup())
-    except RuntimeError as exc:
-        typer.echo(f"End-to-end encryption is unavailable: {exc}", err=True)
-        raise typer.Exit(1) from exc
-    _echo_e2ee_status(status)
-
-
-@e2ee_app.command("import-keys")
-def e2ee_import_keys(
-    file: Path = typer.Argument(
-        ...,
-        exists=True,
-        dir_okay=False,
-        readable=True,
-        help="Room key export file from another Matrix client",
-    ),
-    passphrase: str = typer.Option(
-        ..., prompt=True, hide_input=True, help="Passphrase that protects the export"
-    ),
-    config: Path | None = typer.Option(None, "--config", help="Config file to read"),
-) -> None:
-    """Import exported room keys so older encrypted messages can be read."""
-    from matrix_mcp.e2ee import MatrixE2EE
-
-    settings = _load_credentials(config)
-    try:
-        asyncio.run(MatrixE2EE(settings).import_keys(file, passphrase))
+        asyncio.run(logout(saved))
+        typer.echo("Revoked the access token on the homeserver")
     except (RuntimeError, ValueError) as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1) from exc
-    typer.echo(f"Imported room keys from {file}")
+        if not local_only:
+            typer.echo(
+                f"Could not revoke the token ({exc}); nothing was removed. "
+                "Retry, or pass --local-only and delete the device in another client.",
+                err=True,
+            )
+            raise typer.Exit(1) from exc
+        typer.echo(f"Could not revoke the token ({exc}); delete the device in another client")
+    config_path.unlink()
+    typer.echo(f"Removed Matrix MCP credentials from {config_path}")
 
 
-def _setup_e2ee(config: MatrixMCPConfig) -> None:
-    """Publish device keys right after login so senders start sharing room keys."""
-    from matrix_mcp.e2ee import MatrixE2EE
-
-    if not config.device_id:
-        typer.echo(
-            "Skipped end-to-end encryption setup: the credentials have no device ID.",
-            err=True,
-        )
-        return
-    try:
-        status = asyncio.run(MatrixE2EE(config).setup())
-    except RuntimeError as exc:
-        typer.echo(f"Warning: end-to-end encryption is unavailable: {exc}", err=True)
-        typer.echo(
-            "Unencrypted rooms still work. Retry with `matrix-mcp e2ee setup`.",
-            err=True,
-        )
-        return
-    _echo_e2ee_status(status)
-
-
-def _echo_e2ee_status(status: E2EEStatus) -> None:
-    typer.echo(f"End-to-end encryption ready for device {status.device_id}")
-    typer.echo(f"Device fingerprint (ed25519): {status.fingerprint}")
-
-
-def _load_credentials(config: Path | None) -> MatrixMCPConfig:
+def _load_credentials(config_path: Path) -> MatrixMCPConfig:
     from pydantic import ValidationError
 
     from matrix_mcp.config import MatrixMCPConfig
 
-    config_path = _resolve_config_path(config)
     try:
         return MatrixMCPConfig.load(config_path)
-    except (OSError, ValueError, ValidationError) as exc:
+    except (OSError, ValueError, RuntimeError, ValidationError) as exc:
         typer.echo(f"Cannot read Matrix MCP credentials from {config_path}: {exc}", err=True)
         raise typer.Exit(1) from exc
-
-
-def _e2ee_store_for(config_path: Path) -> Path | None:
-    from pydantic import ValidationError
-
-    from matrix_mcp.config import MatrixMCPConfig
-    from matrix_mcp.e2ee import e2ee_store_path
-
-    try:
-        config = MatrixMCPConfig.load(config_path)
-    except (OSError, ValueError, ValidationError):
-        return None
-    return e2ee_store_path(config) if config.user_id and config.device_id else None
 
 
 def _resolve_config_path(config: Path | None) -> Path:
@@ -425,141 +139,3 @@ def _resolve_config_path(config: Path | None) -> Path:
     from matrix_mcp.config import default_config_path
 
     return default_config_path()
-
-
-def _http_header_config(
-    header_values: list[str] | None,
-    header_command_values: list[str] | None,
-) -> HTTPHeaderConfig:
-    from matrix_mcp.http_headers import (
-        HTTPHeaderConfig,
-        parse_http_header_commands,
-        parse_http_headers,
-    )
-
-    return HTTPHeaderConfig(
-        headers=parse_http_headers(header_values),
-        commands=parse_http_header_commands(header_command_values),
-    )
-
-
-def _with_cloudflare_access_header_command(
-    *,
-    homeserver: str,
-    header_values: list[str] | None,
-    header_command_values: list[str] | None,
-    enabled: bool,
-) -> list[str] | None:
-    if not enabled:
-        return header_command_values
-
-    commands = list(header_command_values or [])
-    header_name = "cf-access-token"
-    configured_header_names = [
-        raw.partition(":")[0].strip().lower() for raw in [*(header_values or []), *commands]
-    ]
-    if header_name in configured_header_names:
-        msg = "--cloudflare-access cannot be combined with a cf-access-token header"
-        raise typer.BadParameter(msg)
-    if shutil.which("cloudflared") is None:
-        from matrix_mcp.http_headers import cloudflared_missing_message
-
-        raise typer.BadParameter(cloudflared_missing_message("--cloudflare-access"))
-
-    command = shlex.join(_cloudflare_access_token_args(homeserver.rstrip("/")))
-    commands.append(f"{header_name}: {command}")
-    return commands
-
-
-def _ensure_cloudflare_access_login(*, homeserver: str) -> None:
-    cloudflared = _cloudflared_executable()
-    app_url = homeserver.rstrip("/")
-    token_args = _cloudflare_access_token_args(app_url, executable=cloudflared)
-    if _cloudflare_access_token_available(token_args):
-        return
-
-    typer.echo("Opening Cloudflare Access login with cloudflared...", err=True)
-    try:
-        login_completed = subprocess.run(  # noqa: S603
-            [cloudflared, "access", "login", app_url],
-            check=False,
-        )
-    except OSError as exc:
-        msg = f"Failed to run cloudflared access login: {exc}"
-        raise typer.BadParameter(msg) from exc
-    if login_completed.returncode != 0:
-        msg = f"cloudflared access login failed with exit {login_completed.returncode}"
-        raise typer.BadParameter(msg)
-
-    try:
-        token_completed = subprocess.run(  # noqa: S603
-            token_args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
-            text=True,
-            timeout=30,
-        )
-    except OSError as exc:
-        msg = f"Failed to run cloudflared access token: {exc}"
-        raise typer.BadParameter(msg) from exc
-    except subprocess.TimeoutExpired as exc:
-        msg = "cloudflared access token timed out after Cloudflare Access login"
-        raise typer.BadParameter(msg) from exc
-
-    if token_completed.returncode != 0:
-        detail = token_completed.stderr.strip() or f"exit {token_completed.returncode}"
-        msg = f"cloudflared access token failed after Cloudflare Access login: {detail}"
-        raise typer.BadParameter(msg)
-
-
-def _cloudflare_access_token_available(token_args: list[str]) -> bool:
-    try:
-        completed = subprocess.run(  # noqa: S603
-            token_args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return completed.returncode == 0
-
-
-def _cloudflare_access_token_args(app_url: str, *, executable: str = "cloudflared") -> list[str]:
-    return [executable, "access", "token", f"-app={app_url}"]
-
-
-def _cloudflared_executable() -> str:
-    executable = shutil.which("cloudflared")
-    if executable is not None:
-        return executable
-
-    from matrix_mcp.http_headers import cloudflared_missing_message
-
-    raise typer.BadParameter(cloudflared_missing_message("--cloudflare-access"))
-
-
-class ProviderLike(Protocol):
-    id: str
-    name: str | None
-    brand: str | None
-
-
-def _fetch_sso_providers(
-    homeserver: str,
-    *,
-    header_config: HTTPHeaderConfig | None = None,
-) -> list[ProviderLike]:
-    from matrix_mcp.auth import fetch_sso_providers
-
-    return list(fetch_sso_providers(homeserver, header_config=header_config))
-
-
-def _provider_label(provider: ProviderLike) -> str:
-    return provider.name or provider.brand or provider.id
-
-
-if __name__ == "__main__":
-    app()
